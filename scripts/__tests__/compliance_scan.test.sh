@@ -1,0 +1,286 @@
+#!/bin/bash
+#
+# compliance_scan.test.sh — public-release compliance gate for this Databricks App repo.
+#
+# Standalone, re-runnable scanner. FAILS (non-zero exit) if the repo contains
+# secrets/tokens or real customer data; PASSES only if clean for public release
+# per databricks-solutions norms.
+#
+# Design principle: false negatives (missing a real secret / customer datum) are
+# the dangerous failure mode, so patterns favor recall — but each is written to
+# skip the OBVIOUS legitimate false positives (env-var reads, ${var.x}
+# placeholders, <angle> placeholders, .example/.template files, empty-string
+# defaults, dummy values). Every exclusion is documented inline.
+#
+set -euo pipefail
+
+# --- Deterministic cd to repo root (two levels up from scripts/__tests__) -----
+cd "$(cd "$(dirname "$0")/../.." && pwd)"
+if [ ! -f databricks.yml ]; then
+  echo "FATAL: not at repo root (databricks.yml not found in $(pwd))" >&2
+  exit 2
+fi
+REPO_ROOT="$(pwd)"
+
+# Path of THIS script relative to repo root, so we skip scanning our own patterns.
+SELF_REL="scripts/__tests__/compliance_scan.test.sh"
+
+# --- Build the list of files to scan: tracked files only (git ls-files excludes
+# node_modules/dist/.git), minus this script, minus lockfiles (huge, hash noise),
+# minus binary screenshots (grep -I also guards this).
+# (read loop instead of mapfile for macOS bash 3.2 portability)
+FILES=()
+while IFS= read -r f; do
+  FILES+=("$f")
+done < <(git ls-files \
+  | grep -vE "^${SELF_REL}$" \
+  | grep -vE '(^|/)package-lock\.json$' )
+
+# Helper: run an ERE grep over the scan set. Emits "path:line:content" hits.
+# Uses -I to skip binary files. Missing-match (exit 1) is fine; we handle it.
+scan() {
+  local pattern="$1"
+  printf '%s\0' "${FILES[@]}" | xargs -0 grep -InE "$pattern" 2>/dev/null || true
+}
+
+# Accumulators
+FAILS=0
+declare -a FINDINGS
+
+record_check() {
+  # $1 = check name, $2 = hits (may be empty)
+  local name="$1"; local hits="$2"
+  if [ -n "$hits" ]; then
+    echo "  FAIL: $name"
+    echo "$hits" | sed 's/^/    > /'
+    FINDINGS+=("$name")
+    FAILS=$((FAILS+1))
+  else
+    echo "  PASS: $name"
+  fi
+}
+
+echo "=============================================================="
+echo "COMPLIANCE SCAN — public-release gate"
+echo "repo: $REPO_ROOT"
+echo "files scanned: ${#FILES[@]} (tracked, minus self + lockfiles)"
+echo "=============================================================="
+
+# ==============================================================================
+# CHECK GROUP 1: SECRETS / TOKENS
+# ==============================================================================
+echo ""
+echo "[1] SECRETS / TOKENS"
+
+# 1a. Databricks PATs: dapi + 32 hex, and dkea (OAuth) tokens.
+# A real PAT is `dapi` followed by exactly 32 hex chars. Env reads never contain
+# a literal token, so matching the literal char class is inherently FP-safe here.
+record_check "Databricks PAT (dapi<32hex> / dkea<hex>)" \
+  "$(scan 'dapi[0-9a-f]{32}|dkea[0-9a-f]{16,}')"
+
+# 1b. AWS access key id: literal AKIA + 16 upper-alnum. No env-read form exists
+# for a literal AKIA..., so the char class alone excludes placeholders.
+record_check "AWS access key id (AKIA...)" \
+  "$(scan 'AKIA[0-9A-Z]{16}')"
+
+# 1c. aws_secret_access_key ASSIGNED a real-looking literal (>=20 base64-ish chars).
+# Excludes: env reads (os.environ / getenv / process.env), ${...} / <...> placeholders,
+# and empty string. We require the value to be a quoted 20+ char secret-shaped token.
+record_check "aws_secret_access_key = <literal>" \
+  "$(scan 'aws_secret_access_key["'\'' ]*[:=][[:space:]]*["'\'' ]*[A-Za-z0-9/+]{20,}' \
+     | grep -viE 'os\.environ|getenv|process\.env|\$\{|<[a-z_]+>|=\s*["'\'']{2}' )"
+
+# 1d. Private keys (PEM blocks). Literal header; no legitimate placeholder form.
+record_check "Private key PEM block" \
+  "$(scan '\-\-\-\-\-BEGIN (RSA|OPENSSH|EC|DSA|PRIVATE) KEY\-\-\-\-\-')"
+
+# 1e. Slack tokens (xoxb-/xoxa-/xoxp-/xoxr-/xoxs-) followed by real token body.
+# Require digits+hyphen body so the bare literal "xoxb-" in docs won't match.
+record_check "Slack token (xox[baprs]-...)" \
+  "$(scan 'xox[baprs]-[0-9]{6,}-[0-9A-Za-z-]{6,}')"
+
+# 1f. GitHub tokens: classic ghp_ + 36, and fine-grained github_pat_ .
+record_check "GitHub token (ghp_ / github_pat_)" \
+  "$(scan 'ghp_[0-9A-Za-z]{36}|github_pat_[0-9A-Za-z_]{20,}')"
+
+# 1g. Google API key: AIza + 35 url-safe chars. Char class excludes placeholders.
+record_check "Google API key (AIza...)" \
+  "$(scan 'AIza[0-9A-Za-z_\-]{35}')"
+
+# 1h. Bearer tokens with a REAL-looking literal after "Bearer ".
+# Excludes: {token}/${...}/<...> interpolation, and the code idiom
+# f"Bearer {token}" / "Bearer " + token used all over config.py. We only flag a
+# long opaque literal (>=20 chars, no space/brace) directly after "Bearer ".
+record_check "Bearer <literal-token>" \
+  "$(scan 'Bearer [A-Za-z0-9._\-]{20,}' \
+     | grep -viE '\{[^}]*\}|\$\{|<[a-z_]+>|Bearer \$|Bearer "' )"
+
+# 1i. password = "<literal>" assignments. This is the classic hardcoded-cred leak.
+# Excludes (all legitimate in this repo): env reads (os.environ.get("...PASSWORD..."),
+# getenv, process.env), assignment FROM a variable (password=token, password=config[...]),
+# ${...}/<...> placeholders, empty string "" / '', and yaml keys with empty value.
+# We require a quoted NON-empty literal that is not itself an env lookup.
+record_check "password = \"<literal>\"" \
+  "$(scan 'password["'\'' ]*[:=][[:space:]]*["'\''][^"'\'' ]+["'\'']' \
+     | grep -viE 'os\.environ|getenv|process\.env|\$\{|<[a-z_]+>|password["'\'' :=]*(""|'\'\'')|["'\'' ]password["'\'' ]*[:=]["'\'' ]*(token|config|None|\$)' )"
+
+# 1j. client_secret ASSIGNED a real literal (excludes env reads / placeholders / empty).
+record_check "client_secret = <literal>" \
+  "$(scan 'client_secret["'\'' ]*[:=][[:space:]]*["'\''][^"'\'' ]{8,}["'\'']' \
+     | grep -viE 'os\.environ|getenv|process\.env|\$\{|<[a-z_]+>' )"
+
+# 1k. DB CLI password on command line: `-p <literal>` / `--password <literal>`.
+# Excludes `-p` followed by a $VAR, ${...}, or <placeholder>.
+record_check "CLI db password (-p/--password <literal>)" \
+  "$(scan '(^|[[:space:]])(-p|--password)[[:space:]]+[^$<[:space:]-][A-Za-z0-9._@!/+-]{5,}' \
+     | grep -viE '\$\{?|<[a-z_]+>|--password[= ]*["'\'']{0,1}\$' )"
+
+# ==============================================================================
+# CHECK GROUP 2: CUSTOMER / REAL DATA & PII
+# ==============================================================================
+echo ""
+echo "[2] CUSTOMER / REAL DATA & PII"
+
+# 2a. Specific customer/workspace identifier this project touched.
+record_check "customer identifier 'demo-centre' / 'demo_centre'" \
+  "$(scan 'demo[-_]centre')"
+
+# 2b. Real workspace deployment hostnames (per-workspace = customer-identifying).
+# dbc-<hex>-<hex>.cloud.databricks.com (AWS/GCP) and adb-<digits>.<n>.azuredatabricks.net.
+# A generic "https://<host>" or *.cloud.databricks.com doc reference without the
+# dbc-/adb- deployment prefix is NOT customer data, so we anchor on the prefix.
+record_check "real workspace hostname (dbc-*.cloud.databricks.com)" \
+  "$(scan 'dbc-[0-9a-f]+-[0-9a-f]+\.cloud\.databricks\.com')"
+record_check "real workspace hostname (adb-*.azuredatabricks.net)" \
+  "$(scan 'adb-[0-9]{6,}\.[0-9]+\.azuredatabricks\.net')"
+
+# 2c. Real numeric workspace/account IDs embedded as data. Databricks workspace
+# ids are long integers; flag `workspace_id`/`account_id` assigned a long literal
+# (>=12 digits). Excludes env reads and ${var}/placeholder forms.
+record_check "hardcoded workspace_id/account_id literal" \
+  "$(scan '(workspace_id|account_id)["'\'' ]*[:=]["'\'' ]*["'\'']?[0-9]{12,}' \
+     | grep -viE 'os\.environ|getenv|process\.env|\$\{|<[a-z_]+>' )"
+
+# 2d. allan.cao personal filesystem paths embedded as DATA (e.g. /Users/allan.cao/...
+# or /Workspace/Users/allan.cao@...). The owner-contact EMAIL is allowed (2f); a
+# personal home path baked into code/data is not.
+record_check "personal filesystem path (/Users/allan.cao, /Workspace/Users/allan.cao)" \
+  "$(scan '/(Users|Workspace/Users|home)/allan\.cao')"
+
+# 2e. Email addresses that are NOT the owner contact or example.com.
+# Owner contact allan.cao@databricks.com is the intended support contact (allowed).
+# security@databricks.com and bugbounty@databricks.com are published Databricks
+# security-reporting addresses (allowed; bugbounty@ is the databricks-solutions
+# org-standard SECURITY.md contact). example.com / example.org are RFC-2606 doc
+# placeholders (allowed). npm-scoped names like @types, @vitejs etc. are not emails
+# (excluded by leading @). Anything else that looks like a real person@company
+# email is flagged.
+record_check "real email address (not owner-contact / example.*)" \
+  "$(scan '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' \
+     | grep -viE 'allan\.cao@databricks\.com|security@databricks\.com|bugbounty@databricks\.com|@example\.(com|org|net)|(^|[^A-Za-z0-9._%+-])@(types|vitejs|tailwindcss|databricks|radix-ui|testing-library|babel|eslint|rollup|vitejs)' )"
+
+# 2f. Data files that must be inspected for real datasets. This repo ships NO
+# .csv/.parquet/.jsonl data files (it reads the customer's live environment).
+# If any appear, flag for manual inspection — sample data must be clearly synthetic.
+DATA_FILES="$(printf '%s\n' "${FILES[@]}" | grep -iE '\.(csv|parquet|avro|orc|jsonl|ndjson)$' || true)"
+record_check "no raw data files (.csv/.parquet/.jsonl/...) shipped" "$DATA_FILES"
+
+# ==============================================================================
+# CHECK GROUP 3: DATA HANDLING & SECURE DEFAULTS
+# ==============================================================================
+# The app reads a customer's own workspace, so its metadata and query results may
+# be sensitive. These checks are regression guards for the app's security
+# controls. Each pattern matches the INSECURE form, so a PASS means the insecure
+# form is absent.
+echo ""
+echo "[3] DATA HANDLING & SECURE DEFAULTS"
+
+# Helper: restrict a scan to Python sources.
+scan_py() { scan "$1" | grep -E '\.py:' || true; }
+
+# 3a. Per-user records keyed on the raw forwarded-email header. That header is
+# set by the Databricks Apps proxy, but a route that trusts it directly is one
+# network path away from letting a caller read another user's history (CWE-290).
+# Routes must key on the resolved principal (server/security.py:resolve_principal).
+record_check "ownership keyed on the raw X-Forwarded-Email header" \
+  "$(scan_py 'created_by\s*=\s*x_forwarded_email')"
+
+# 3b. Raw exception text returned to the client. Upstream SQL Warehouse / Genie /
+# FM API errors quote the failing statement and object names, and can quote a
+# column value (CWE-209). Handlers must use security.safe_error and return a
+# reference id. Matches str(e)/str(exc) on a line that also builds a client payload.
+record_check "raw exception text returned to the client" \
+  "$(scan_py 'str\(e(xc)?\)' \
+     | grep -vE ':[0-9]+:[[:space:]]*(#|logger\.|log\.|print\()' \
+     | grep -E '(return|yield|\"error\"|'\''error'\''|\"note\"|'\''note'\''|json\.dumps|_empty\(|content=)' )"
+
+# 3c. aiohttp sessions with no timeout. A stalled upstream otherwise pins a
+# worker and its connection open for the life of the process (CWE-400).
+record_check "aiohttp session without a timeout" \
+  "$(scan_py 'aiohttp\.ClientSession\(\s*\)')"
+
+# 3d. Genie question text written to the log. Questions are free text against the
+# customer's own warehouse and can quote values from the data itself; log a
+# digest, never the content (CWE-532).
+record_check "Genie question content written to the log" \
+  "$(scan_py 'logger\.[a-z]+\(.*content\[' )"
+
+# 3e. Catalog/schema names interpolated into SQL inside bare backticks. Names come
+# from the metastore, so a name containing a backtick closes the quoting early
+# (CWE-89). Use security.quote_ident, which doubles embedded backticks.
+record_check "unescaped backtick identifier interpolation in SQL" \
+  "$(scan_py '`\{' )"
+
+# 3f. Postgres connections that encrypt without verifying the peer. `require`
+# encrypts but authenticates nothing, so it gives no in-path protection.
+record_check "Lakebase TLS without certificate verification" \
+  "$(scan_py 'ssl\s*=\s*[\"'\'']require[\"'\'']')"
+
+# 3g. The plan PDF renderer must refuse external resources. Without a
+# link_callback, xhtml2pdf resolves src/href in model-generated Markdown and will
+# read local files into the returned PDF (CWE-918/CWE-22).
+# (the call spans several lines, so compare occurrence counts rather than grepping
+# a single line for both)
+PDF_CALLS="$(scan_py 'pisa\.CreatePDF\(' | wc -l | tr -d ' ')"
+PDF_GUARDS="$(scan_py 'link_callback\s*=' | wc -l | tr -d ' ')"
+record_check "pisa.CreatePDF without a link_callback" \
+  "$( [ "$PDF_CALLS" -le "$PDF_GUARDS" ] || echo "  $PDF_CALLS CreatePDF call(s) but only $PDF_GUARDS link_callback guard(s)" )"
+
+# 3g-bis. The Genie Conversation API returns ROWS from the customer's warehouse.
+# Hard-wiring it to the app service principal — which holds SELECT on every
+# assessed catalog — lets any app viewer read tables they have no grant on
+# (CWE-269). It must run on-behalf-of the viewer; see server/genie_client.py.
+GENIE_SP_CALLS="$(scan_py 'get_auth_headers\(force_sp=True\)' | grep -c 'genie_client\.py' || true)"
+GENIE_SP_GATED="$(scan_py 'GENIE_ALLOW_SP_FALLBACK' | grep -c 'genie_client\.py' || true)"
+record_check "Genie API hard-wired to the service principal" \
+  "$( [ "$GENIE_SP_CALLS" -eq 0 ] || [ "$GENIE_SP_GATED" -ge 1 ] || echo "  service-principal Genie call is not gated on GENIE_ALLOW_SP_FALLBACK" )"
+
+# 3g-ter. Every endpoint that returns customer data or per-user records must
+# resolve an identity first. Flags a Genie route that takes no principal.
+GENIE_ROUTES="$(scan_py '^async def genie_' | wc -l | tr -d ' ')"
+GENIE_GUARDED="$(scan_py 'Depends\(current_principal\)' | grep -c 'routes/genie\.py' || true)"
+record_check "Genie route without an authenticated principal" \
+  "$( [ "$GENIE_ROUTES" -le "$GENIE_GUARDED" ] || echo "  $GENIE_ROUTES genie route(s) but only $GENIE_GUARDED principal guard(s)" )"
+
+# 3h. React escapes by default; dangerouslySetInnerHTML opts out of that and would
+# make model-generated plan Markdown an XSS sink (CWE-79).
+record_check "dangerouslySetInnerHTML in the frontend" \
+  "$(scan 'dangerouslySetInnerHTML')"
+
+# ==============================================================================
+# SUMMARY
+# ==============================================================================
+echo ""
+echo "=============================================================="
+if [ "$FAILS" -eq 0 ]; then
+  echo "RESULT: PASS — repo is clean for public release."
+  echo "=============================================================="
+  exit 0
+else
+  echo "RESULT: FAIL — $FAILS check(s) flagged. Offending checks:"
+  for f in "${FINDINGS[@]}"; do echo "  - $f"; done
+  echo "Investigate each: real leak => remove/externalize the value;"
+  echo "false positive => tighten the pattern (do not neuter the check)."
+  echo "=============================================================="
+  exit 1
+fi

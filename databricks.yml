@@ -1,0 +1,108 @@
+bundle:
+  name: genie-ontology-readiness
+
+# Customer-deployable Databricks App that assesses a workspace's readiness for
+# Genie Ontology / Unity Catalog Business Semantics and generates tailored
+# enablement plans. It READS the existing environment — it does not seed data.
+
+# The built frontend (app/frontend/dist) and the rendered app/app.yml are
+# .gitignored (build artifact / workspace-specific), but the app needs both at
+# runtime — force-include them in the deploy sync. node_modules stays excluded.
+sync:
+  include:
+    - app/frontend/dist/**
+    - app/app.yml
+
+variables:
+  warehouse_id:
+    description: "SQL Warehouse ID used for assessment queries (databricks api get /api/2.0/sql/warehouses)"
+    # Empty default so `databricks bundle validate` (the local quality gate's CHECK 2)
+    # passes without a required-variable error; every deploy overrides via --var.
+    default: ""
+  assess_catalogs:
+    description: "Optional comma-separated catalogs to assess (empty = all non-system catalogs the app SP can see)"
+    default: ""
+  genie_space_id:
+    description: "Optional Genie Agent ID to enable the live answer-quality test (pillar 5)"
+    default: ""
+  lakebase_instance_name:
+    description: "Lakebase instance that hosts this app's per-user history DB (the app gets its own database on it). Only needed when USE_LAKEBASE=true. Leave empty to let post_deploy.py skip history persistence; set to an existing instance name to reuse it."
+    default: ""
+  lakebase_database:
+    description: "Lakebase PostgreSQL database name (created on the instance above by post_deploy.py)"
+    default: ontology_readiness
+
+resources:
+  apps:
+    ontology_readiness:
+      # App name is fixed PER TARGET (see the `targets:` block below), NOT a
+      # variable — so it cannot be overridden with `--var app_name=…`. That
+      # override, combined with shared Terraform state, is what let a deploy
+      # rename/destroy another environment's app. `bundle deploy -t <target>`
+      # can now only ever touch that target's own pinned app name.
+      #
+      # This base value is a deliberate non-environment placeholder: every target
+      # overrides it, so it is never deployed. If a future target forgets its
+      # override it stands up this obviously-wrong app instead of silently
+      # reconciling the live prod app's state.
+      name: gor-no-target-selected
+      description: "Genie Ontology Readiness — assess, learn, and plan"
+      source_code_path: ./app
+      # On-behalf-of-user (user authorization): when enabled, the app can run
+      # metadata reads as the *viewing user* (their UC permissions) instead of the
+      # app SP, so it inherits their catalog access. Requires the workspace admin
+      # to enable user authorization (Public Preview). The app degrades to the SP
+      # when no user token is forwarded. `sql` covers warehouse/UC reads.
+      # (iam.current-user:read / iam.access-control:read are auto-added defaults —
+      # don't list them here; they aren't settable user_api_scopes.)
+      # NOTE: bundle deploy sets user_api_scopes on app *create*; to add it to an
+      # already-created app, run: databricks apps update <name> --json '{... "user_api_scopes":["sql"] ...}'.
+      user_api_scopes:
+        - sql
+      resources:
+        - name: sql-warehouse
+          sql_warehouse:
+            id: ${var.warehouse_id}
+            permission: CAN_USE
+      # NOTE: read grants for the app service principal (system schemas + target
+      # catalogs) are applied by scripts/post_deploy.py after the SP exists.
+      #
+      # Per-user assessment/plan history is persisted in Lakebase. There is no
+      # database_instances block here on purpose: when USE_LAKEBASE=true,
+      # post_deploy.py creates a dedicated database on the existing Lakebase
+      # instance named by ${var.lakebase_instance_name} (LAKEBASE_INSTANCE_NAME)
+      # and attaches the 'lakebase-db' app resource. Leaving the instance name
+      # empty keeps the app stateless.
+
+targets:
+  # Each environment is its OWN target, so it gets its OWN bundle/Terraform state
+  # (…/.bundle/${bundle.name}/<target>) and pins its own app name via a resource
+  # override (not a variable — there is nothing to `--var`). A `bundle deploy` to
+  # one target therefore can NEVER rename or destroy another target's app — the
+  # shared-state footgun that silently deletes apps.
+  #
+  # Routine redeploys should use `databricks apps deploy <name>` (code-only,
+  # non-destructive, needs no bundle state); reserve `bundle deploy` for the
+  # first-time create / infra reconcile. If the app already exists OUTSIDE this
+  # target's Terraform state (e.g. it was created with `apps create`), use
+  # `apps deploy` — a `bundle deploy` would try to create it and conflict.
+  #
+  # Names: dev (the default target) → …-dev, stg → …-stg, prod → the bare
+  # `genie-ontology-readiness`. Deploy `-t prod` for the unsuffixed production
+  # name; a plain `bundle deploy` (or `-t dev`) targets the …-dev app.
+  dev:
+    default: true
+    resources:
+      apps:
+        ontology_readiness:
+          name: genie-ontology-readiness-dev
+  stg:
+    resources:
+      apps:
+        ontology_readiness:
+          name: genie-ontology-readiness-stg
+  prod:
+    resources:
+      apps:
+        ontology_readiness:
+          name: genie-ontology-readiness

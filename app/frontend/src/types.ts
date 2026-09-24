@@ -1,0 +1,356 @@
+// Shared types matching the backend API contract (base path /api).
+
+export interface AIModel {
+  id: string;
+  label: string;
+  provider: string;
+  family: string;
+  open_source: boolean;
+}
+
+export interface ConfigPillar {
+  key: string;
+  name: string;
+  short: string;
+  weight: number;
+  capability: string;
+}
+
+export interface AppConfig {
+  app_name: string;
+  brand_name: string;
+  workspace_id: string;
+  level_labels: string[];
+  pillars: ConfigPillar[];
+  ai_models: AIModel[];
+  default_model: string;
+  lakebase_enabled: boolean;
+  genie_space_configured: boolean;
+  assess_catalogs: string[];
+}
+
+export interface Signal {
+  label: string;
+  value: number | string;
+  unit?: string;
+  detail: string;
+}
+
+export interface UcSchemaCount {
+  schema: string;
+  tables: number;
+}
+export interface TopAccessedTable {
+  name: string;
+  accesses: number;
+  certified: boolean;
+}
+export interface ContentQuery {
+  title: string;
+  sql: string;
+}
+
+// Per-catalog/schema/agent/workspace breakdown of where a pillar's gap is (#10).
+export interface DrillDownColumn {
+  key: string;
+  label: string;
+  unit?: string;
+}
+export interface DrillDown {
+  title: string;
+  columns: DrillDownColumn[];
+  rows: Record<string, string | number | null>[];
+  // Column keys the drill-down modal offers as slice-by filters (workspace/catalog/schema/agent).
+  dimensions?: string[];
+}
+
+// A catalog accessible to the selected workspaces, for the pre-run catalog filter.
+export interface CatalogInfo {
+  name: string;
+  access: string; // 'OPEN' | 'READ' | 'READ_WRITE' | 'ALL'
+  isolation: string;
+}
+export interface CatalogsResponse {
+  catalogs: CatalogInfo[];
+  available: boolean;
+}
+
+// One SQL statement a pillar ran, for the "view the query" disclosure (#22).
+export interface SourceQuery {
+  sql: string;
+  parameters?: Record<string, string>;
+  label?: string;
+}
+
+// Why an unavailable pillar couldn't be read (#20) — distinct from a genuine 0.
+export type UnavailableReason = 'insufficient_permission' | 'scan_failed' | 'not_enabled';
+
+// A workspace on the metastore, for the pre-run workspace filter.
+export interface WorkspaceInfo {
+  id: string;
+  name: string;
+  url: string | null;
+  status: string | null;
+  is_current: boolean;
+}
+export interface WorkspacesResponse {
+  workspaces: WorkspaceInfo[];
+  current_workspace_id: string | null;
+  available: boolean;
+}
+export interface WorkspaceFilterValue {
+  mode: 'include' | 'exclude';
+  workspace_ids: string[];
+}
+
+export interface PillarScore {
+  key: string;
+  name: string;
+  short: string;
+  capability: string;
+  weight: number;
+  score: number;
+  technical_score: number | null;
+  level: number;
+  level_label: string;
+  available: boolean;
+  note: string | null;
+  signals: Signal[];
+  gaps: string[];
+  best_practices: string[];
+  summary: string;
+  metrics: Record<string, unknown>;
+  identity: SignalIdentity | null;
+  drill_down: DrillDown | null;
+  source_queries: SourceQuery[];
+  unavailable_reason: UnavailableReason | null;
+}
+
+// Which identity actually served a pillar's reads, so the UI can show whether the
+// signal reflects the viewer's own grants (OBO) or the app service principal's.
+export interface SignalIdentity {
+  ran_as: 'user' | 'service_principal' | 'mixed';
+  via: string;
+  label: string;
+  detail: string;
+}
+
+export interface ScorecardOverall {
+  score: number;
+  level: number;
+  level_label: string;
+  readiness_stage: string;
+  readiness_detail: string;
+  assessed_at?: string;
+}
+
+export interface TopGap {
+  pillar: string;
+  gap: string;
+}
+
+export interface Scorecard {
+  overall: ScorecardOverall;
+  pillars: PillarScore[];
+  top_gaps: TopGap[];
+}
+
+export interface HistorySnapshot {
+  id: string | number;
+  created_at: string;
+  created_by: string;
+  overall_score: number;
+  overall_level: number;
+}
+
+export interface HistoryResponse {
+  snapshots: HistorySnapshot[];
+}
+
+export interface SnapshotResponse {
+  id: string | number;
+  created_at: string;
+  created_by: string;
+  scorecard: Scorecard;
+}
+
+// --- Assessment comparison (issue #12) -------------------------------------
+export interface LevelChange {
+  from: number;
+  to: number;
+  from_label: string;
+  to_label: string;
+  direction: 'up' | 'down';
+}
+
+export type PillarDiffStatus =
+  | 'improved'
+  | 'regressed'
+  | 'unchanged'
+  | 'new'
+  | 'removed'
+  | 'unavailable';
+
+export interface SignalDiff {
+  label: string;
+  unit: string;
+  baseline: number | string | null;
+  current: number | string | null;
+  delta: number | null;
+}
+
+export interface GapDiff {
+  resolved: string[];
+  introduced: string[];
+}
+
+export interface PillarDiff {
+  key: string;
+  name: string;
+  baseline_score: number | null;
+  current_score: number | null;
+  delta: number | null;
+  status: PillarDiffStatus;
+  level_change: LevelChange | null;
+  signals: SignalDiff[];
+  gaps: GapDiff;
+}
+
+export interface CompareOverall {
+  baseline_score: number | null;
+  current_score: number | null;
+  delta: number | null;
+  baseline_level: number | null;
+  current_level: number | null;
+  baseline_level_label: string;
+  current_level_label: string;
+  level_change: LevelChange | null;
+  stage_change: { from: string; to: string } | null;
+}
+
+export interface CompareEndpoint {
+  id: number | string | null;
+  created_at: string | null;
+  overall: ScorecardOverall;
+}
+
+export interface CompareResult {
+  baseline: CompareEndpoint;
+  current: CompareEndpoint;
+  overall: CompareOverall;
+  pillars: PillarDiff[];
+  summary: {
+    improved: number;
+    regressed: number;
+    unchanged: number;
+    new: number;
+    removed: number;
+    unavailable: number;
+  };
+}
+
+export interface PlanListItem {
+  id: number;
+  created_at: string;
+  created_by: string;
+  snapshot_id: number | null;
+  title: string;
+  model: string;
+}
+
+export interface PlansResponse {
+  plans: PlanListItem[];
+}
+
+export interface PlanDetail extends PlanListItem {
+  plan_markdown: string;
+}
+
+export interface PlanSaveResponse {
+  id: number | null;
+  saved: boolean;
+}
+
+export interface DocSource {
+  title: string;
+  url: string;
+}
+
+export type AcceleratorType = 'notebook' | 'sql' | 'dab' | 'dashboard' | 'repo' | 'guide';
+
+export interface Accelerator {
+  key: string;
+  title: string;
+  summary: string;
+  capability: string;
+  type: AcceleratorType;
+  effort: string;
+  what_it_does: string;
+  prerequisites: string[];
+  improves_signals: string[];
+  target_level: number;
+  review_mode: boolean;
+  steps: string[];
+  artifact_dir?: string;
+  artifact_file?: string;
+  // Filename the artifact should download/import as, when it differs from the
+  // on-disk artifact_file (e.g. a notebook stored as `.py.txt` to survive deploy).
+  download_as?: string;
+  source?: DocSource;
+  valid_as_of?: string;
+  superseded_by?: string;
+}
+
+export interface Capability {
+  key: string;
+  name: string;
+  tagline: string;
+  what: string;
+  technical_value: string;
+  business_value: string;
+  technical_enablement: string[];
+  business_adoption: string[];
+  best_practices: string[];
+  sources: DocSource[];
+  queries?: ContentQuery[];
+  accelerators?: Accelerator[];
+}
+
+export interface ContentResponse {
+  capabilities: Capability[];
+}
+
+export interface ChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+export interface GenieSpaceCuration {
+  title: string;
+  instructions: number;
+  sample_questions: number;
+  example_sqls: number;
+  functions: number;
+  benchmarks: number;
+  tables: number;
+}
+
+export interface GenieSpace {
+  id: string;
+  title: string;
+}
+
+export interface GenieSpacesResponse {
+  spaces: GenieSpace[];
+  note?: string;
+}
+
+export interface GenieResult {
+  result: {
+    text: string;
+    sql: string;
+    columns: string[];
+    // Backend builds each row as an object keyed by column name (see genie_client.py).
+    rows: Record<string, unknown>[];
+  };
+}
