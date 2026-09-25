@@ -23,8 +23,18 @@ const STAGES: { key: string; label: string }[] = [
 
 type GenEvent =
   | { type: 'progress'; stage: string; done: number; total: number }
-  | { type: 'complete'; download_token: string; counts: Record<string, number> }
+  | { type: 'complete'; download_token: string; counts: Record<string, number>; failures?: Record<string, number> }
   | { type: 'error'; error: string; reference?: string };
+
+// Section key -> the noun used in "N could not be generated" messaging.
+const FAILURE_LABELS: Record<string, string> = {
+  catalog: 'catalog',
+  schema: 'schema',
+  entity: 'entity',
+  entity_columns: 'column',
+  genie_agent: 'agent',
+  metric_views: 'metric view',
+};
 
 type Progress = { done: number; total: number };
 
@@ -52,6 +62,7 @@ export default function GenerateWizard({
   const [progress, setProgress] = useState<Record<string, Progress>>({});
   const [token, setToken] = useState<string | null>(null);
   const [counts, setCounts] = useState<Record<string, number>>({});
+  const [failures, setFailures] = useState<Record<string, number>>({});
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -82,6 +93,7 @@ export default function GenerateWizard({
     setError(null);
     setToken(null);
     setCounts({});
+    setFailures({});
     setProgress({});
     const controller = new AbortController();
     abortRef.current = controller;
@@ -97,6 +109,7 @@ export default function GenerateWizard({
         } else if (ev.type === 'complete') {
           setToken(ev.download_token);
           setCounts(ev.counts || {});
+          setFailures(ev.failures || {});
           setPhase('done');
         } else if (ev.type === 'error') {
           setError(ev.error);
@@ -116,6 +129,11 @@ export default function GenerateWizard({
   }
 
   const running = phase === 'running';
+  const totalFailures = Object.values(failures).reduce((a, b) => a + b, 0);
+  const failureBreakdown = Object.entries(failures)
+    .filter(([, n]) => n > 0)
+    .map(([key, n]) => `${n} ${FAILURE_LABELS[key] || key}${n === 1 ? '' : 's'}`)
+    .join(', ');
   const scopedWorkspaceLabel = (
     <span className="inline-flex items-center gap-1.5 rounded-md border border-gray-200 bg-gray-50 px-2.5 py-1.5 text-xs text-ink-600 max-w-[240px]">
       <Server size={13} className="text-ink-400 shrink-0" />
@@ -222,6 +240,19 @@ export default function GenerateWizard({
               >
                 <Sheet size={15} /> Download Excel
               </button>
+            </div>
+          )}
+
+          {phase === 'done' && token && totalFailures > 0 && (
+            <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3 flex items-start gap-2.5 text-sm text-amber-800">
+              <AlertTriangle size={15} className="mt-0.5 shrink-0 text-amber-500" />
+              <span>
+                <span className="font-medium">
+                  {totalFailures} item{totalFailures === 1 ? '' : 's'} could not be generated
+                </span>
+                {failureBreakdown && <> ({failureBreakdown})</>} — the model returned nothing usable for these; see the
+                app logs for why. Everything else downloaded successfully above; re-run to retry the rest.
+              </span>
             </div>
           )}
         </div>

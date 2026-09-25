@@ -362,6 +362,28 @@ async def _generate(detail: dict, s: dict, model: str, emit):
     return payload
 
 
+def _blank(v) -> bool:
+    return not (v or "").strip()
+
+
+def _compute_failures(payload: dict) -> dict:
+    """Per-section count of rows whose LLM-drafted field(s) came back blank — the
+    call ran (or was attempted) but produced no usable content; `_llm_json` already
+    logged why. Deterministic sections (relationship_pk/fk are derived from column
+    names, not the LLM) are never counted here. Surfaced in the SSE `complete`
+    event so a partial failure is visible in the UI, not just the app log."""
+    def count(rows, *fields):
+        return sum(1 for r in rows if all(_blank(r.get(f)) for f in fields))
+    return {
+        "catalog": count(payload.get("catalog", []), "description", "tag"),
+        "schema": count(payload.get("schema", []), "description", "tag"),
+        "entity": count(payload.get("entity", []), "entity_description", "entity_tag"),
+        "entity_columns": count(payload.get("entity_columns", []), "column_comment"),
+        "genie_agent": count(payload.get("genie_agent", []), "instructions"),
+        "metric_views": count(payload.get("metric_views", []), "text"),
+    }
+
+
 @router.post("/generate/stream")
 async def generate_stream(
     req: GenerateRequest = Body(default=GenerateRequest()),
@@ -393,7 +415,8 @@ async def generate_stream(
                 buf = build_generation_workbook(payload)
                 tok = _store("genie-ontology-readiness-generated.xlsx", buf.getvalue())
                 counts = {k: len(v) for k, v in payload.items()}
-                await queue.put({"type": "complete", "download_token": tok, "counts": counts})
+                failures = _compute_failures(payload)
+                await queue.put({"type": "complete", "download_token": tok, "counts": counts, "failures": failures})
             except Exception as e:
                 ref, msg = safe_error(e, "generate stream", logger)
                 await queue.put({"type": "error", "error": msg, "reference": ref})

@@ -95,5 +95,36 @@ class PerItemGenerationTest(unittest.IsolatedAsyncioTestCase):
                                         "column": "amount", "column_comment": "Order amount in USD."}])
 
 
+class ComputeFailuresTest(unittest.TestCase):
+    """The completion banner's "N items could not be generated" count — a row whose
+    LLM-drafted field(s) came back blank is counted as a failure; a row that never
+    ran (section absent) counts zero, not an error."""
+
+    def test_counts_blank_rows_per_section(self):
+        payload = {
+            "catalog": [{"catalog": "a", "description": "d", "tag": "t"},
+                       {"catalog": "b", "description": "", "tag": ""}],
+            "schema": [{"schema": "s1", "description": "", "tag": ""}],
+            "entity": [{"entity": "orders", "entity_description": "d", "entity_tag": "t"}],
+            "entity_columns": [{"column": "amount", "column_comment": ""},
+                               {"column": "id", "column_comment": "The primary key."}],
+            "genie_agent": [{"name": "Sales", "instructions": ""}],
+            "metric_views": [],
+        }
+        failures = gen._compute_failures(payload)
+        self.assertEqual(failures["catalog"], 1)
+        self.assertEqual(failures["schema"], 1)
+        self.assertEqual(failures["entity"], 0)
+        self.assertEqual(failures["entity_columns"], 1)
+        self.assertEqual(failures["genie_agent"], 1)
+        self.assertEqual(failures["metric_views"], 0)
+
+    def test_missing_sections_count_as_zero_not_error(self):
+        self.assertEqual(gen._compute_failures({}), {
+            "catalog": 0, "schema": 0, "entity": 0,
+            "entity_columns": 0, "genie_agent": 0, "metric_views": 0,
+        })
+
+
 if __name__ == "__main__":
     unittest.main()
