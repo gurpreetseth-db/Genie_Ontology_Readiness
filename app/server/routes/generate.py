@@ -1,15 +1,31 @@
 """LLM metadata-generation → downloadable Excel.
 
 `POST /generate/stream` runs the entity-level detail (scoped), then uses the
-workspace's own Foundation Model API (the same model picker the Plan tab uses) to
-DRAFT the missing metadata — catalog/schema/entity descriptions + tags, column
-comments, Genie-agent instructions, and metric-view definitions — and derives PK/FK
-DDL deterministically. It streams progress (SSE) and ends with a `download_token`;
+workspace's own Foundation Model API to DRAFT the missing metadata —
+catalog/schema/entity descriptions + tags, column comments, Genie-agent
+instructions, and metric-view definitions — and derives PK/FK DDL
+deterministically. It streams progress (SSE) and ends with a `download_token`;
 `GET /generate/excel/{token}` returns the assembled workbook.
 
 Nothing is applied to Unity Catalog. Every output is a suggestion for review — the
 PK/FK rows carry ready-to-run `ALTER TABLE … NOT ENFORCED RELY` statements, but the
 customer runs them.
+
+MODEL INVOCATION: every LLM call goes through Databricks SQL's `ai_query()`
+built-in, executed via the SAME SQL-warehouse connection (`execute_sql`) the
+entity-level assessment itself already uses — not a direct REST call to
+`/serving-endpoints/.../invocations`. This intentionally mirrors the proven
+pattern in this app's own `app/accelerators/metadata-ai-comments/` notebook
+accelerator (which calls `ai_query()` from `spark.sql()` and is documented on the
+Learn tab as "AI-generated, glossary-grounded column comments"). Two prior
+iterations of this endpoint used the REST/streaming path (the same one the Plan
+tab's chat uses) and, even after fixing a real batching bug, case-sensitive key
+matching, and reply truncation, every generated field still came back blank —
+pointing at the REST/streaming call itself, not the JSON-parsing layer sitting on
+top of it, as this app's assessment queries (same `execute_sql` path `ai_query`
+now shares) are demonstrably working. `model` (from the header-driven model
+picker) is passed straight through as `ai_query`'s endpoint-name argument, so the
+model selector still names the actual serving endpoint invoked.
 """
 
 import json
@@ -28,9 +44,9 @@ from server.assessment.probes import _resolve_sources, _src, _internal_catalog_f
 from server.sql_client import execute_sql
 from server.config import set_user_token
 from server.workspace_filter import set_workspace_filter, set_catalog_scope
-from server.routes._shared import stream_llm_chat, _ai_model
+from server.routes._shared import _ai_model
 from server.excel import build_generation_workbook
-from server.security import safe_error
+from server.security import quote_literal, safe_error
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -65,36 +81,41 @@ class GenerateRequest(BaseModel):
     catalogs: list[str] = []
 
 
-async def _complete(model: str, system: str, user: str, max_tokens: int, _what: str) -> Optional[str]:
-    """Run one FM API completion, return the concatenated content text (possibly
-    empty), or None on a transport/upstream-error failure. Logged so a blank field
-    is diagnosable from the app log."""
-    parts = []
+async def _complete(model: str, prompt: str, _what: str) -> Optional[str]:
+    """Run one model completion via Databricks SQL's `ai_query()` built-in,
+    executed through the existing SQL-warehouse connection (`execute_sql`) — the
+    same call path the entity-level assessment itself uses, and the one this
+    app's own metadata-ai-comments accelerator demonstrates working from
+    `spark.sql()`. `ai_query` takes a single combined prompt (no separate
+    system/user roles in the simple 2-argument form used here — the same form the
+    accelerator uses) and returns the model's full text reply as a plain string;
+    there is no streaming/SSE to reassemble.
+
+    The endpoint name is embedded as an escaped SQL string literal (matching how
+    the accelerator itself interpolates it), not a bind parameter — some
+    Databricks Runtime versions resolve an AI function's endpoint argument at
+    query-analysis time, before parameter substitution. `record=False`: a wide
+    generation run can fire many of these, and they'd otherwise flood the
+    assessment's "SQL behind this score" disclosure with near-identical entries.
+
+    Returns the trimmed reply text (possibly empty), or None on a query/transport
+    failure. Every failure is logged so a blank field is diagnosable from the app
+    log rather than silent.
+    """
     try:
-        async for chunk in stream_llm_chat(
-            [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            model=model, max_tokens=max_tokens, temperature=0.2,
-        ):
-            line = chunk.strip()
-            if not line.startswith("data: "):
-                continue
-            body = line[6:]
-            if body == "[DONE]":
-                break
-            try:
-                obj = json.loads(body)
-            except Exception:
-                continue
-            if obj.get("error"):
-                logger.warning(f"generate: LLM error for {_what or 'item'} (model={model}): "
-                               f"{str(obj.get('error'))[:160]}")
-                return None
-            if obj.get("content"):
-                parts.append(obj["content"])
+        rows = await execute_sql(
+            f"SELECT ai_query({quote_literal(model)}, :prompt) AS resp",
+            parameters={"prompt": prompt},
+            record=False,
+        )
     except Exception as e:
-        logger.warning(f"generate: LLM completion failed for {_what or 'item'} (model={model}): {str(e)[:160]}")
+        logger.warning(f"generate: ai_query failed for {_what or 'item'} (model={model}): {str(e)[:200]}")
         return None
-    return "".join(parts).strip()
+    if not rows:
+        logger.warning(f"generate: ai_query returned no rows for {_what or 'item'} (model={model})")
+        return None
+    resp = rows[0].get("resp")
+    return (resp or "").strip()
 
 
 def _extract_json(text: str):
@@ -124,17 +145,18 @@ _JSON_ONLY_REMINDER = (
 )
 
 
-async def _llm_json(model: str, system: str, user: str, max_tokens: int = 1200, _what: str = ""):
-    """Run an FM API completion and parse a JSON object/array from the reply,
-    retrying ONCE with a stricter reminder if the first reply wasn't valid JSON —
-    models routinely add a preamble or wrap the JSON in prose despite explicit
-    instructions not to, and a low max_tokens can also truncate the JSON before it
-    closes. A transport/upstream error is NOT retried (already logged, and an
-    immediate retry won't fix an outage). Returns None if every attempt fails;
-    every failure is logged with the model + a truncated snippet."""
-    prompt = user
+async def _llm_json(model: str, system: str, user: str, _what: str = ""):
+    """Run a model completion (via `_complete` / `ai_query`) and parse a JSON
+    object/array from the reply, retrying ONCE with a stricter reminder if the
+    first reply wasn't valid JSON — models routinely add a preamble or wrap the
+    JSON in prose despite explicit instructions not to. `system` and `user` are
+    combined into one prompt (`ai_query`'s simple form has no separate role
+    turns). A transport/query failure is NOT retried (already logged, and an
+    immediate retry won't fix it). Returns None if every attempt fails; every
+    failure is logged with the model + a truncated snippet."""
+    prompt = f"{system}\n\n{user}"
     for attempt in range(2):
-        text = await _complete(model, system, prompt, max_tokens, _what)
+        text = await _complete(model, prompt, _what)
         if text is None:
             return None
         if text:
@@ -146,7 +168,7 @@ async def _llm_json(model: str, system: str, user: str, max_tokens: int = 1200, 
         else:
             logger.warning(f"generate: empty LLM reply for {_what or 'item'} "
                            f"(model={model}, attempt {attempt + 1})")
-        prompt = user + _JSON_ONLY_REMINDER
+        prompt = f"{system}\n\n{user}" + _JSON_ONLY_REMINDER
     return None
 
 
@@ -279,7 +301,7 @@ async def _gen_catalog_item(model, sem, cat, pillar, schema_names):
                 "schemas, write a business-meaningful description and a governed tag. "
                 'Return STRICT JSON {"description": "<one business sentence>", '
                 '"tag": "<one lower_snake_case governed tag value>"}.')
-        data = await _llm_json(model, _SYS_META, user, max_tokens=600, _what=f"catalog {cat}") or {}
+        data = await _llm_json(model, _SYS_META, user, _what=f"catalog {cat}") or {}
         return {"pillar": pillar, "catalog": cat,
                 "description": _pick_str(data, "description"), "tag": _pick_str(data, "tag", "governed_tag")}
 
@@ -292,7 +314,7 @@ async def _gen_schema_item(model, sem, cat, sch, pillar, entity_names):
                 "tables, write a business-meaningful description and a governed tag. "
                 'Return STRICT JSON {"description": "<one business sentence>", '
                 '"tag": "<one lower_snake_case governed tag value>"}.')
-        data = await _llm_json(model, _SYS_META, user, max_tokens=700, _what=f"schema {cat}.{sch}") or {}
+        data = await _llm_json(model, _SYS_META, user, _what=f"schema {cat}.{sch}") or {}
         return {"pillar": pillar, "catalog": cat, "schema": sch,
                 "description": _pick_str(data, "description"), "tag": _pick_str(data, "tag", "governed_tag")}
 
@@ -309,7 +331,7 @@ async def _gen_entity(model, sem, cat, sch, ent, pillar, cols):
                 'column. Return STRICT JSON {"description": "<one business sentence>", '
                 '"tag": "<one lower_snake_case governed tag value>", '
                 '"columns": {"<column>": "<short business comment>"}}.')
-        data = await _llm_json(model, _SYS_META, user, max_tokens=2200, _what=f"entity {cat}.{sch}.{ent}") or {}
+        data = await _llm_json(model, _SYS_META, user, _what=f"entity {cat}.{sch}.{ent}") or {}
         desc = _pick_str(data, "description")
         tag = _pick_str(data, "tag", "governed_tag")
         comments = _pick_dict(data, "columns", "column_comments", "comments")
@@ -328,7 +350,7 @@ async def _gen_agent(model, sem, name, sid):
         user = (f'Draft concise, high-quality Genie space instructions for the agent "{name}". '
                 "Cover: the business domain, key metrics and their definitions, join guidance, "
                 "and answer style. Return STRICT JSON {\"instructions\": \"<text>\"}.")
-        data = await _llm_json(model, _SYS_META, user, max_tokens=1200, _what=f"genie agent {name}") or {}
+        data = await _llm_json(model, _SYS_META, user, _what=f"genie agent {name}") or {}
         return {"name": name, "space_id": sid, "instructions": _pick_str(data, "instructions")}
 
 
@@ -338,7 +360,7 @@ async def _gen_metric_view(model, sem, cat, sch, entities_summary):
                 f"tables/columns: {json.dumps(entities_summary)[:4000]}. Return STRICT JSON "
                 '{"text": "<CREATE VIEW ... WITH METRICS LANGUAGE YAML ... $$ ... $$>"} with '
                 "sensible measures and dimensions. Use fully-qualified names.")
-        data = await _llm_json(model, _SYS_META, user, max_tokens=2200, _what=f"metric view {cat}.{sch}") or {}
+        data = await _llm_json(model, _SYS_META, user, _what=f"metric view {cat}.{sch}") or {}
         return {"catalog": cat, "schema": sch, "text": _pick_str(data, "text", "sql", "ddl")}
 
 

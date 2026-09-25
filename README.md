@@ -41,13 +41,21 @@ The Generate tab is **export-only** — it never writes to Unity Catalog.
   Every catalog, schema, entity and column is a **separate, grounded LLM call** (never a
   batch the model has to echo names back from), so one item's failure or rewording can
   never blank another item's fields. PK/FK suggestions are heuristic — review before applying.
-  Generation is resilient to how the model actually replies: a **case/alias-tolerant field
-  lookup** (a capitalized `"Description"` or renamed `"desc"` key still reads correctly), a
-  **one-shot retry with a stricter reminder** when a reply isn't valid JSON, and generous
-  `max_tokens` per call-type so a reply isn't truncated before its JSON closes. Any item that
-  still comes back blank after both attempts is counted and surfaced in the completion
-  banner ("N items could not be generated — see the app logs for why") instead of failing
-  silently.
+
+  **Model invocation goes through `ai_query()` on the SQL warehouse** (`execute_sql`), the
+  same call path the entity-level assessment itself uses — **not** a direct REST call to
+  `/serving-endpoints/.../invocations` (the path Plan's chat uses). This mirrors the proven
+  pattern in `app/accelerators/metadata-ai-comments/` (the Learn tab's "AI-generated,
+  glossary-grounded column comments" accelerator, which calls `ai_query()` from
+  `spark.sql()`). Two earlier iterations of this endpoint used the REST/streaming path and,
+  even after fixing a real batching bug plus case-sensitive key matching and reply
+  truncation, every generated field still came back blank — evidence pointing at the
+  REST/streaming call itself rather than the JSON-parsing layer on top of it. Generation is
+  also resilient to how the model replies: a **case/alias-tolerant field lookup** (a
+  capitalized `"Description"` or renamed `"desc"` key still reads correctly) and a **one-shot
+  retry with a stricter reminder** when a reply isn't valid JSON. Any item that still comes
+  back blank after both attempts is counted and surfaced in the completion banner ("N items
+  could not be generated — see the app logs for why") instead of failing silently.
 - **Shared workspace + catalog scope** (`hooks/useWorkspaceScope.ts`, owned by `AppShell` in
   `App.tsx`) — pick catalogs **once** and it applies to both the Assess and Generate tabs
   (Plan needs no scope of its own; it works off whatever scorecard Assess already produced).
@@ -151,6 +159,7 @@ covered by the `sql` user scope) and Lakebase credential minting.
 | Adoption & Activity | `system.access.audit`, `system.query.history` | `USE`+`SELECT` on `system.access` and `system.query` |
 | Top‑10 most‑accessed + certified | `system.access.table_lineage` + `information_schema.table_tags` | `USE`+`SELECT` on `system.access` + catalog metadata |
 | Plan / Assistant (LLM) | Foundation Model API | model serving / FMAPI enabled for the workspace |
+| Generate (LLM metadata drafting) | `ai_query()` via the SQL warehouse | `CAN USE` on the warehouse + `CAN QUERY` on the target serving endpoint. Requires a **Pro or Serverless** SQL warehouse (`ai_query` isn't available on Classic). Unlike Plan, this does **not** call `/serving-endpoints/.../invocations` directly — see [Enhancements in this fork](#enhancements-in-this-fork). |
 
 > [!NOTE]
 > **SP fallback.** Under OBO each signal is attempted **as the viewer first**. If

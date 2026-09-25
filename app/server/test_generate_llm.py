@@ -1,98 +1,158 @@
-"""LLM-call plumbing for the Generate tab: JSON extraction, and the per-item
-catalog/schema/entity generators that replaced the batched, name-echo-matched
-design. That earlier design asked the model to echo an exact name back in a JSON
-array and matched results by that string — any model-side rewording (case,
-whitespace, dropping a `catalog.` prefix) made the lookup miss for EVERY row,
-which is exactly the "every generated field is blank" bug this guards against.
+"""LLM-call plumbing for the Generate tab: the ai_query() invocation, JSON
+extraction, and the per-item catalog/schema/entity generators.
+
+Two bugs are guarded against here, in order of discovery:
+
+1. The ORIGINAL design sent the LLM a BATCH of catalog/schema names and asked
+   it to echo each "name" back in a JSON array, matching results by that
+   string — any model-side rewording (case, whitespace, dropping a `catalog.`
+   prefix) made the lookup miss for EVERY row. Fixed by making every
+   catalog/schema/entity a separate, grounded call (see PerItemGenerationTest).
+
+2. Even after that fix, every generated field stayed blank. The remaining
+   cause: `_complete` called the model via a direct REST call to
+   `/serving-endpoints/.../invocations` (the same path the Plan tab's chat
+   uses) — while this app's own metadata-ai-comments accelerator proves
+   `ai_query()` (via `spark.sql()`) is the working invocation path in this
+   deployment. `_complete` now runs `ai_query()` through the SAME SQL-warehouse
+   connection (`execute_sql`) the assessment itself already uses successfully,
+   mocked here via `execute_sql` rather than the old `stream_llm_chat` SSE shape.
 """
 
 import asyncio
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from server.routes import generate as gen
 
 
-def _sse(content: str) -> str:
-    """One `data: {"content": ...}` SSE line, matching _stream_from_fmapi's shape."""
-    return f"data: {json.dumps({'content': content})}\n\n"
+class CompleteTest(unittest.IsolatedAsyncioTestCase):
+    """_complete: the ai_query() call itself, mocked at the execute_sql boundary
+    (the same mocking convention this repo's other async tests use, e.g.
+    server/assessment/test_genie_audit.py's `patch.object(probes, "execute_sql", ...)`)."""
+
+    async def test_returns_the_resp_column_trimmed(self):
+        execute = AsyncMock(return_value=[{"resp": "  hello  "}])
+        with patch.object(gen, "execute_sql", execute):
+            result = await gen._complete("model", "prompt text", "catalog main")
+        self.assertEqual(result, "hello")
+        # The endpoint name is an escaped SQL literal (ai_query's endpoint arg
+        # is resolved at query-analysis time on some DBR versions, so it can't
+        # always be a bind parameter); the prompt itself IS a bind parameter.
+        query = execute.await_args.args[0]
+        self.assertIn("ai_query('model', :prompt)", query)
+        self.assertEqual(execute.await_args.kwargs["parameters"], {"prompt": "prompt text"})
+        # Many generation calls can fire in one run; none should flood the
+        # assessment's "SQL behind this score" disclosure.
+        self.assertFalse(execute.await_args.kwargs["record"])
+
+    async def test_escapes_a_quote_in_the_endpoint_name(self):
+        execute = AsyncMock(return_value=[{"resp": "ok"}])
+        with patch.object(gen, "execute_sql", execute):
+            await gen._complete("o'brien-endpoint", "prompt", "item")
+        query = execute.await_args.args[0]
+        self.assertIn("ai_query('o''brien-endpoint', :prompt)", query)
+
+    async def test_returns_none_on_query_failure(self):
+        execute = AsyncMock(side_effect=RuntimeError("warehouse unreachable"))
+        with patch.object(gen, "execute_sql", execute):
+            result = await gen._complete("model", "prompt", "item")
+        self.assertIsNone(result)
+
+    async def test_returns_none_on_no_rows(self):
+        execute = AsyncMock(return_value=[])
+        with patch.object(gen, "execute_sql", execute):
+            result = await gen._complete("model", "prompt", "item")
+        self.assertIsNone(result)
 
 
-async def _stream_ok(*_a, **_k):
-    """Mimic stream_llm_chat's SSE shape for one clean, unfenced JSON reply."""
-    yield _sse(json.dumps({"description": "Sales data.", "tag": "sales"}))
-    yield "data: [DONE]\n\n"
-
-
-async def _stream_fenced(*_a, **_k):
-    """A reply wrapped in a ```json code fence, split across multiple deltas —
-    the shape a real model commonly returns despite "STRICT JSON only"."""
-    body = json.dumps({"description": "Order facts.", "tag": "orders"})
-    yield _sse("```json\n")
-    yield _sse(body[: len(body) // 2])
-    yield _sse(body[len(body) // 2 :])
-    yield _sse("\n```")
-    yield "data: [DONE]\n\n"
-
-
-async def _stream_error(*_a, **_k):
-    yield f"data: {json.dumps({'error': 'model unavailable'})}\n\n"
-    yield "data: [DONE]\n\n"
-
-
-async def _stream_entity(*_a, **_k):
-    payload = {"description": "Order facts.", "tag": "orders",
-               "columns": {"amount": "Order amount in USD."}}
-    yield _sse(json.dumps(payload))
-    yield "data: [DONE]\n\n"
-
-
-async def _stream_prose_only(*_a, **_k):
-    """A reply with no JSON at all — the model ignored the format instruction
-    entirely, on every attempt."""
-    yield _sse("I'm not able to provide that right now, sorry.")
-    yield "data: [DONE]\n\n"
-
-
-async def _stream_recovers_on_retry(messages, *_a, **_k):
-    """First attempt: unparsable prose. Second attempt (after _llm_json appends
-    the stricter JSON-only reminder to the user message): valid JSON. Proves the
-    retry-with-correction path actually recovers a model that ignored the format
-    instruction the first time."""
-    user_content = messages[1]["content"] if len(messages) > 1 else ""
-    if "did not contain a single valid JSON object" in user_content:
-        yield _sse(json.dumps({"description": "Recovered on retry.", "tag": "sales"}))
-    else:
-        yield _sse("Sure! Here's some information, but not in JSON form.")
-    yield "data: [DONE]\n\n"
+def _resp(execute_mock, text: str):
+    """Configure the execute_sql mock to return one ai_query-shaped row."""
+    execute_mock.return_value = [{"resp": text}]
 
 
 class LlmJsonTest(unittest.IsolatedAsyncioTestCase):
     async def test_parses_plain_object(self):
-        with patch.object(gen, "stream_llm_chat", _stream_ok):
+        execute = AsyncMock(return_value=[{"resp": json.dumps({"description": "Sales data.", "tag": "sales"})}])
+        with patch.object(gen, "execute_sql", execute):
             result = await gen._llm_json("model", "sys", "user")
         self.assertEqual(result, {"description": "Sales data.", "tag": "sales"})
 
-    async def test_strips_code_fence_across_chunks(self):
-        with patch.object(gen, "stream_llm_chat", _stream_fenced):
+    async def test_strips_code_fence(self):
+        body = json.dumps({"description": "Order facts.", "tag": "orders"})
+        execute = AsyncMock(return_value=[{"resp": f"```json\n{body}\n```"}])
+        with patch.object(gen, "execute_sql", execute):
             result = await gen._llm_json("model", "sys", "user")
         self.assertEqual(result, {"description": "Order facts.", "tag": "orders"})
 
-    async def test_returns_none_on_error_event(self):
-        with patch.object(gen, "stream_llm_chat", _stream_error):
+    async def test_returns_none_when_the_query_itself_fails(self):
+        execute = AsyncMock(side_effect=RuntimeError("endpoint not found"))
+        with patch.object(gen, "execute_sql", execute):
             result = await gen._llm_json("model", "sys", "user")
         self.assertIsNone(result)
 
     async def test_retries_once_with_stricter_reminder_and_recovers(self):
-        with patch.object(gen, "stream_llm_chat", _stream_recovers_on_retry):
+        """First attempt: unparsable prose. Second attempt (after _llm_json
+        appends the stricter JSON-only reminder to the combined prompt): valid
+        JSON. Proves the retry-with-correction path actually recovers a model
+        that ignored the format instruction the first time."""
+        execute = AsyncMock()
+
+        async def _side_effect(query, parameters=None, record=True):
+            prompt = parameters["prompt"]
+            if "did not contain a single valid JSON object" in prompt:
+                return [{"resp": json.dumps({"description": "Recovered on retry.", "tag": "sales"})}]
+            return [{"resp": "Sure! Here's some information, but not in JSON form."}]
+
+        execute.side_effect = _side_effect
+        with patch.object(gen, "execute_sql", execute):
             result = await gen._llm_json("model", "sys", "user prompt")
         self.assertEqual(result, {"description": "Recovered on retry.", "tag": "sales"})
+        self.assertEqual(execute.await_count, 2)
 
     async def test_gives_up_after_two_failed_attempts(self):
-        with patch.object(gen, "stream_llm_chat", _stream_prose_only):
+        execute = AsyncMock(return_value=[{"resp": "I cannot produce that."}])
+        with patch.object(gen, "execute_sql", execute):
             result = await gen._llm_json("model", "sys", "user prompt")
         self.assertIsNone(result)
+        self.assertEqual(execute.await_count, 2)
+
+
+class PerItemGenerationTest(unittest.IsolatedAsyncioTestCase):
+    """Regression coverage for the original batching bug: catalog/schema/entity
+    generation must never depend on the model echoing a name back."""
+
+    async def test_catalog_item_does_not_depend_on_name_echo(self):
+        sem = asyncio.Semaphore(2)
+        execute = AsyncMock(return_value=[{"resp": json.dumps({"description": "Sales data.", "tag": "sales"})}])
+        with patch.object(gen, "execute_sql", execute):
+            row = await gen._gen_catalog_item("model", sem, "main", "sales_pillar", ["s1", "s2"])
+        self.assertEqual(row, {"pillar": "sales_pillar", "catalog": "main",
+                               "description": "Sales data.", "tag": "sales"})
+
+    async def test_schema_item_does_not_depend_on_name_echo(self):
+        sem = asyncio.Semaphore(2)
+        execute = AsyncMock(return_value=[{"resp": json.dumps({"description": "Sales data.", "tag": "sales"})}])
+        with patch.object(gen, "execute_sql", execute):
+            row = await gen._gen_schema_item("model", sem, "main", "s1", "sales_pillar", ["orders"])
+        self.assertEqual(row, {"pillar": "sales_pillar", "catalog": "main", "schema": "s1",
+                               "description": "Sales data.", "tag": "sales"})
+
+    async def test_entity_generation_splits_entity_and_column_rows(self):
+        sem = asyncio.Semaphore(2)
+        payload = {"description": "Order facts.", "tag": "orders",
+                   "columns": {"amount": "Order amount in USD."}}
+        execute = AsyncMock(return_value=[{"resp": json.dumps(payload)}])
+        with patch.object(gen, "execute_sql", execute):
+            entity_row, column_rows = await gen._gen_entity(
+                "model", sem, "main", "s1", "orders", "sales_pillar", ["amount"]
+            )
+        self.assertEqual(entity_row["entity_description"], "Order facts.")
+        self.assertEqual(entity_row["entity_tag"], "orders")
+        self.assertNotIn("column", entity_row)  # Entity sheet is entity-grain only
+        self.assertEqual(column_rows, [{"catalog": "main", "schema": "s1", "entity": "orders",
+                                        "column": "amount", "column_comment": "Order amount in USD."}])
 
 
 class PickHelpersTest(unittest.TestCase):
@@ -120,36 +180,6 @@ class PickHelpersTest(unittest.TestCase):
                          "The order total.")
         self.assertEqual(gen._pick_column_comment({"amount": "  "}, "amount"), "")
         self.assertEqual(gen._pick_column_comment({}, "amount"), "")
-
-
-class PerItemGenerationTest(unittest.IsolatedAsyncioTestCase):
-    """Regression coverage for the actual reported bug."""
-
-    async def test_catalog_item_does_not_depend_on_name_echo(self):
-        sem = asyncio.Semaphore(2)
-        with patch.object(gen, "stream_llm_chat", _stream_ok):
-            row = await gen._gen_catalog_item("model", sem, "main", "sales_pillar", ["s1", "s2"])
-        self.assertEqual(row, {"pillar": "sales_pillar", "catalog": "main",
-                               "description": "Sales data.", "tag": "sales"})
-
-    async def test_schema_item_does_not_depend_on_name_echo(self):
-        sem = asyncio.Semaphore(2)
-        with patch.object(gen, "stream_llm_chat", _stream_ok):
-            row = await gen._gen_schema_item("model", sem, "main", "s1", "sales_pillar", ["orders"])
-        self.assertEqual(row, {"pillar": "sales_pillar", "catalog": "main", "schema": "s1",
-                               "description": "Sales data.", "tag": "sales"})
-
-    async def test_entity_generation_splits_entity_and_column_rows(self):
-        sem = asyncio.Semaphore(2)
-        with patch.object(gen, "stream_llm_chat", _stream_entity):
-            entity_row, column_rows = await gen._gen_entity(
-                "model", sem, "main", "s1", "orders", "sales_pillar", ["amount"]
-            )
-        self.assertEqual(entity_row["entity_description"], "Order facts.")
-        self.assertEqual(entity_row["entity_tag"], "orders")
-        self.assertNotIn("column", entity_row)  # Entity sheet is entity-grain only
-        self.assertEqual(column_rows, [{"catalog": "main", "schema": "s1", "entity": "orders",
-                                        "column": "amount", "column_comment": "Order amount in USD."}])
 
 
 class ComputeFailuresTest(unittest.TestCase):
