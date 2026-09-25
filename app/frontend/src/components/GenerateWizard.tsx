@@ -145,8 +145,10 @@ export default function GenerateWizard({
           </h3>
           <p className="text-sm text-ink-700 leading-relaxed">
             One workbook with a tab per artifact — <span className="font-medium">Catalog, Schema, Entity,
-            Relationship_PrimaryKey, Relationship_ForeignKey, GenieAgent, MetricViews</span> — each row a suggested fix
-            you can review and apply. PK/FK relationships are proposed heuristically; review before applying.
+            Entity_Columns, Relationship_PrimaryKey, Relationship_ForeignKey, GenieAgent, MetricViews</span> — each row
+            a suggested fix you can review and apply. Every description/tag/comment is drafted by the selected model
+            after reviewing the real catalog, schema, table and column names — not a template. PK/FK relationships
+            are proposed heuristically; review before applying.
           </p>
         </div>
 
@@ -204,6 +206,7 @@ export default function GenerateWizard({
                   counts.catalog && `${counts.catalog} catalog`,
                   counts.schema && `${counts.schema} schema`,
                   counts.entity && `${counts.entity} entity`,
+                  counts.entity_columns && `${counts.entity_columns} column`,
                   (counts.relationship_pk || counts.relationship_fk) &&
                     `${(counts.relationship_pk || 0) + (counts.relationship_fk || 0)} relationship`,
                   counts.genie_agent && `${counts.genie_agent} agent`,

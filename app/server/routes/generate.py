@@ -65,9 +65,11 @@ class GenerateRequest(BaseModel):
     catalogs: list[str] = []
 
 
-async def _llm_json(model: str, system: str, user: str, max_tokens: int = 1200):
+async def _llm_json(model: str, system: str, user: str, max_tokens: int = 1200, _what: str = ""):
     """Run one FM API completion and parse a JSON object/array from the reply.
-    Returns None on any failure (the caller degrades that row to a blank suggestion)."""
+    Returns None on any failure (the caller degrades that row to a blank suggestion).
+    Every failure is logged with the model + a truncated snippet of what came back, so a
+    blank field in the workbook is diagnosable from the app log rather than silent."""
     parts = []
     try:
         async for chunk in stream_llm_chat(
@@ -85,14 +87,17 @@ async def _llm_json(model: str, system: str, user: str, max_tokens: int = 1200):
             except Exception:
                 continue
             if obj.get("error"):
+                logger.warning(f"generate: LLM error for {_what or 'item'} (model={model}): "
+                               f"{str(obj.get('error'))[:160]}")
                 return None
             if obj.get("content"):
                 parts.append(obj["content"])
     except Exception as e:
-        logger.info(f"llm completion failed: {str(e)[:100]}")
+        logger.warning(f"generate: LLM completion failed for {_what or 'item'} (model={model}): {str(e)[:160]}")
         return None
     text = "".join(parts).strip()
     if not text:
+        logger.warning(f"generate: empty LLM reply for {_what or 'item'} (model={model})")
         return None
     # Strip ``` fences and locate the JSON payload.
     if text.startswith("```"):
@@ -105,6 +110,8 @@ async def _llm_json(model: str, system: str, user: str, max_tokens: int = 1200):
                 return json.loads(text[i:j + 1])
             except Exception:
                 pass
+    logger.warning(f"generate: could not parse JSON for {_what or 'item'} (model={model}); "
+                   f"reply started with: {text[:160]!r}")
     return None
 
 
@@ -174,48 +181,57 @@ _SYS_META = ("You are a Databricks Unity Catalog metadata expert preparing an es
              "lower_snake_case governed tag value. Reply with STRICT JSON only, no prose.")
 
 
-async def _gen_named(model, kind, items):
-    """catalogs/schemas: [{...,'name'}] -> description + tag via one batched call each."""
-    if not items:
-        return []
-    names = [i["name"] for i in items]
-    user = (f"For each {kind} name, return a JSON array of objects "
-            f'{{"name","description","tag"}}. description: one business sentence; '
-            f'tag: one lower_snake_case value.\n{kind} names: {json.dumps(names)}')
-    data = await _llm_json(model, _SYS_META, user, max_tokens=1400)
-    by = {}
-    if isinstance(data, list):
-        for d in data:
-            if isinstance(d, dict) and d.get("name"):
-                by[d["name"]] = d
-    out = []
-    for i in items:
-        d = by.get(i["name"], {})
-        out.append({**i, "description": d.get("description", ""), "tag": d.get("tag", "")})
-    return out
+async def _gen_catalog_item(model, sem, cat, pillar, schema_names):
+    """One LLM call per catalog. Grounded in the catalog's own schema names (a
+    "careful review of metadata and its name", not a bare-name guess) — and, unlike
+    a batched call, the result is keyed by call site, not by asking the model to
+    echo the name back, so a model-side rewording can never blank every row."""
+    async with sem:
+        ctx = f" It contains schemas: {json.dumps(schema_names[:40])}." if schema_names else ""
+        user = (f"Unity Catalog catalog `{cat}`.{ctx} Based on the catalog name and its "
+                "schemas, write a business-meaningful description and a governed tag. "
+                'Return STRICT JSON {"description": "<one business sentence>", '
+                '"tag": "<one lower_snake_case governed tag value>"}.')
+        data = await _llm_json(model, _SYS_META, user, max_tokens=400, _what=f"catalog {cat}") or {}
+        return {"pillar": pillar, "catalog": cat,
+                "description": data.get("description", ""), "tag": data.get("tag", "")}
+
+
+async def _gen_schema_item(model, sem, cat, sch, pillar, entity_names):
+    """One LLM call per schema, grounded in its entity names."""
+    async with sem:
+        ctx = f" It contains tables: {json.dumps(entity_names[:60])}." if entity_names else ""
+        user = (f"Unity Catalog schema `{cat}.{sch}`.{ctx} Based on the schema name and its "
+                "tables, write a business-meaningful description and a governed tag. "
+                'Return STRICT JSON {"description": "<one business sentence>", '
+                '"tag": "<one lower_snake_case governed tag value>"}.')
+        data = await _llm_json(model, _SYS_META, user, max_tokens=400, _what=f"schema {cat}.{sch}") or {}
+        return {"pillar": pillar, "catalog": cat, "schema": sch,
+                "description": data.get("description", ""), "tag": data.get("tag", "")}
 
 
 async def _gen_entity(model, sem, cat, sch, ent, pillar, cols):
+    """One LLM call per entity: description + tag + a comment for every listed
+    (uncommented) column. Returns (entity_row, column_rows) — kept separate so the
+    Entity sheet stays entity-grain and columns land in their own Entity_Columns sheet."""
     async with sem:
-        user = (f"Table `{cat}.{sch}.{ent}` has columns: {json.dumps(cols)}. "
-                'Return STRICT JSON {"description": "<one business sentence>", '
+        ctx = f" It has columns: {json.dumps(cols)}." if cols else ""
+        user = (f"Unity Catalog table `{cat}.{sch}.{ent}`.{ctx} Based on the table name, its "
+                "schema, and its column names, write a business-meaningful description and a "
+                "governed tag for the table, and a short business comment for every listed "
+                'column. Return STRICT JSON {"description": "<one business sentence>", '
                 '"tag": "<one lower_snake_case governed tag value>", '
-                '"columns": {"<column>": "<short business comment>"}}. '
-                "Comment every listed column.")
-        data = await _llm_json(model, _SYS_META, user, max_tokens=1400) or {}
+                '"columns": {"<column>": "<short business comment>"}}.')
+        data = await _llm_json(model, _SYS_META, user, max_tokens=1400, _what=f"entity {cat}.{sch}.{ent}") or {}
         desc, tag = data.get("description", ""), data.get("tag", "")
         comments = data.get("columns", {}) if isinstance(data.get("columns"), dict) else {}
-        rows = []
-        if cols:
-            for c in cols:
-                rows.append({"pillar": pillar, "catalog": cat, "schema": sch, "entity": ent,
-                             "column": c, "entity_description": desc, "entity_tag": tag,
-                             "column_comment": comments.get(c, "")})
-        else:
-            rows.append({"pillar": pillar, "catalog": cat, "schema": sch, "entity": ent,
-                         "column": "", "entity_description": desc, "entity_tag": tag,
-                         "column_comment": ""})
-        return rows
+        entity_row = {"pillar": pillar, "catalog": cat, "schema": sch, "entity": ent,
+                      "entity_description": desc, "entity_tag": tag}
+        column_rows = [
+            {"catalog": cat, "schema": sch, "entity": ent, "column": c, "column_comment": comments.get(c, "")}
+            for c in cols
+        ]
+        return entity_row, column_rows
 
 
 async def _gen_agent(model, sem, name, sid):
@@ -223,7 +239,7 @@ async def _gen_agent(model, sem, name, sid):
         user = (f'Draft concise, high-quality Genie space instructions for the agent "{name}". '
                 "Cover: the business domain, key metrics and their definitions, join guidance, "
                 "and answer style. Return STRICT JSON {\"instructions\": \"<text>\"}.")
-        data = await _llm_json(model, _SYS_META, user, max_tokens=900) or {}
+        data = await _llm_json(model, _SYS_META, user, max_tokens=900, _what=f"genie agent {name}") or {}
         return {"name": name, "space_id": sid, "instructions": data.get("instructions", "")}
 
 
@@ -233,37 +249,57 @@ async def _gen_metric_view(model, sem, cat, sch, entities_summary):
                 f"tables/columns: {json.dumps(entities_summary)[:4000]}. Return STRICT JSON "
                 '{"text": "<CREATE VIEW ... WITH METRICS LANGUAGE YAML ... $$ ... $$>"} with '
                 "sensible measures and dimensions. Use fully-qualified names.")
-        data = await _llm_json(model, _SYS_META, user, max_tokens=1500) or {}
+        data = await _llm_json(model, _SYS_META, user, max_tokens=1500, _what=f"metric view {cat}.{sch}") or {}
         return {"catalog": cat, "schema": sch, "text": data.get("text", "")}
 
 
 async def _generate(detail: dict, s: dict, model: str, emit):
-    """Build the generation payload from the failing items in `detail`."""
+    """Build the generation payload from the failing items in `detail`. Every
+    catalog/schema/entity is a SEPARATE, grounded LLM call (never a batch the model
+    must echo names back from) — a model-side rewording of one item can never blank
+    every row, and each item gets real child-metadata context, not a bare name."""
     sem = asyncio.Semaphore(_CONCURRENCY)
-    payload: dict = {"catalog": [], "schema": [], "entity": [],
+    payload: dict = {"catalog": [], "schema": [], "entity": [], "entity_columns": [],
                      "relationship_pk": [], "relationship_fk": [],
                      "genie_agent": [], "metric_views": []}
 
-    # 1. Catalogs + 2. schemas (batched)
-    fail_cats = [{"pillar": r["pillar"], "catalog": r["catalog"], "name": r["catalog"]}
-                 for r in detail.get("catalogs", []) if r.get("status") == "FAIL"][:_CAP["catalogs"]]
+    # 1. Catalogs — one call per catalog, grounded in its own schema names.
+    fail_cats = [r for r in detail.get("catalogs", []) if r.get("status") == "FAIL"][:_CAP["catalogs"]]
+    schemas_by_cat: dict[str, list] = {}
+    for r in detail.get("schemas", []):
+        schemas_by_cat.setdefault(r["catalog"], []).append(r["schema"])
     await emit("catalogs", 0, len(fail_cats))
-    payload["catalog"] = [{"pillar": r["pillar"], "catalog": r["catalog"],
-                           "description": d.get("description", ""), "tag": d.get("tag", "")}
-                          for r, d in zip(fail_cats, await _gen_named(model, "catalog", fail_cats))]
+    if fail_cats:
+        ctasks = [_gen_catalog_item(model, sem, r["catalog"], r.get("pillar", ""),
+                                    schemas_by_cat.get(r["catalog"], [])) for r in fail_cats]
+        done = 0
+        for coro in asyncio.as_completed(ctasks):
+            payload["catalog"].append(await coro)
+            done += 1
+            if done % 5 == 0 or done == len(ctasks):
+                await emit("catalogs", done, len(ctasks))
     await emit("catalogs", len(fail_cats), len(fail_cats))
 
-    fail_schemas = [{"pillar": r["pillar"], "catalog": r["catalog"], "schema": r["schema"],
-                     "name": f"{r['catalog']}.{r['schema']}"}
-                    for r in detail.get("schemas", []) if r.get("status") == "FAIL"][:_CAP["schemas"]]
+    # 2. Schemas — one call per schema, grounded in its own entity names.
+    fail_schemas = [r for r in detail.get("schemas", []) if r.get("status") == "FAIL"][:_CAP["schemas"]]
+    entities_by_schema: dict[tuple, list] = {}
+    for r in detail.get("entities", []):
+        entities_by_schema.setdefault((r["catalog"], r["schema"]), []).append(r["entity"])
     await emit("schemas", 0, len(fail_schemas))
-    sgen = await _gen_named(model, "schema", fail_schemas)
-    payload["schema"] = [{"pillar": r["pillar"], "catalog": r["catalog"], "schema": r["schema"],
-                          "description": d.get("description", ""), "tag": d.get("tag", "")}
-                         for r, d in zip(fail_schemas, sgen)]
+    if fail_schemas:
+        stasks = [_gen_schema_item(model, sem, r["catalog"], r["schema"], r.get("pillar", ""),
+                                   entities_by_schema.get((r["catalog"], r["schema"]), [])) for r in fail_schemas]
+        done = 0
+        for coro in asyncio.as_completed(stasks):
+            payload["schema"].append(await coro)
+            done += 1
+            if done % 5 == 0 or done == len(stasks):
+                await emit("schemas", done, len(stasks))
     await emit("schemas", len(fail_schemas), len(fail_schemas))
 
-    # 3. Entities (per-entity LLM; needs column names)
+    # 3. Entities (per-entity LLM; needs column names). Each call returns an
+    # entity-grain row plus its own column-grain rows — kept in separate payload
+    # lists so the workbook's Entity and Entity_Columns sheets stay at their own grain.
     fail_entities = [r for r in detail.get("entities", []) if r.get("status") == "FAIL"][:_CAP["entities"]]
     ent_keys = {(r["catalog"], r["schema"], r["entity"]) for r in fail_entities}
     cols_map = await _entity_columns(s, ent_keys)
@@ -279,7 +315,9 @@ async def _generate(detail: dict, s: dict, model: str, emit):
         tasks.append(_gen_entity(model, sem, r["catalog"], r["schema"], r["entity"], r.get("pillar", ""), cols))
     done = 0
     for coro in asyncio.as_completed(tasks):
-        payload["entity"].extend(await coro)
+        entity_row, column_rows = await coro
+        payload["entity"].append(entity_row)
+        payload["entity_columns"].extend(column_rows)
         done += 1
         if done % 5 == 0 or done == len(tasks):
             await emit("entities", done, len(tasks))

@@ -49,7 +49,9 @@ def test_generation_workbook_exact_spec():
         "catalog": [{"pillar": "sales", "catalog": "main", "description": "d", "tag": "t"}],
         "schema": [{"pillar": "sales", "catalog": "main", "schema": "s1", "description": "d", "tag": "t"}],
         "entity": [{"pillar": "sales", "catalog": "main", "schema": "s1", "entity": "orders",
-                    "column": "amount", "entity_description": "d", "entity_tag": "t", "column_comment": "c"}],
+                    "entity_description": "d", "entity_tag": "t"}],
+        "entity_columns": [{"catalog": "main", "schema": "s1", "entity": "orders",
+                            "column": "amount", "column_comment": "c"}],
         "relationship_pk": [{"catalog": "main", "schema": "s1", "parent_entity": "orders",
                              "column_name": "order_id", "statement": "ALTER TABLE ..."}],
         "relationship_fk": [{"catalog": "main", "schema": "s1", "parent_entity": "customers",
@@ -60,13 +62,15 @@ def test_generation_workbook_exact_spec():
         "metric_views": [{"catalog": "main", "schema": "s1", "text": "CREATE VIEW ..."}],
     }
     wb = load_workbook(build_generation_workbook(payload))
-    for tab in ("Catalog", "Schema", "Entity", "Relationship_PrimaryKey",
+    for tab in ("Catalog", "Schema", "Entity", "Entity_Columns", "Relationship_PrimaryKey",
                 "Relationship_ForeignKey", "GenieAgent", "MetricViews"):
         assert tab in wb.sheetnames, f"missing tab {tab}"
     assert _headers(wb, "Catalog") == ["Pillar", "Catalog", "Catalog_Description_Generated", "Catalog_Tag_Generated"]
     assert _headers(wb, "Schema") == ["Pillar", "Catalog", "Schema", "Schema_Description_Generated", "Schema_Tag_Generated"]
-    assert _headers(wb, "Entity") == ["Pillar", "Catalog", "Schema", "Entity", "Column",
-                                      "Entity_Description_Generated", "Entity_Tag_Generated", "Column_Comment_Generated"]
+    # Entity is entity-grain only — no Column / Column_Comment_Generated here.
+    assert _headers(wb, "Entity") == ["Pillar", "Catalog", "Schema", "Entity",
+                                      "Entity_Description_Generated", "Entity_Tag_Generated"]
+    assert _headers(wb, "Entity_Columns") == ["Catalog", "Schema", "Entity", "Column", "Column_Comments_Generated"]
     assert _headers(wb, "Relationship_PrimaryKey") == ["Catalog", "Schema", "Parent_Entity", "Column_Name",
                                                        "Constraint_Type", "Statement"]
     assert _headers(wb, "Relationship_ForeignKey") == ["Catalog", "Schema", "Parent_Entity", "Column_Name",
@@ -77,3 +81,10 @@ def test_generation_workbook_exact_spec():
     # Constraint_Type constants are stamped by the builder, not the payload.
     assert wb["Relationship_PrimaryKey"]["E2"].value == "PrimaryKey"
     assert wb["Relationship_ForeignKey"]["H2"].value == "ForeignKey"
+    # The generated description/tag/comment actually landed (regression guard for
+    # the per-item generation fix — a batched, name-echo-matched call used to blank
+    # every row silently).
+    assert wb["Catalog"]["C2"].value == "d" and wb["Catalog"]["D2"].value == "t"
+    assert wb["Schema"]["D2"].value == "d" and wb["Schema"]["E2"].value == "t"
+    assert wb["Entity"]["E2"].value == "d" and wb["Entity"]["F2"].value == "t"
+    assert wb["Entity_Columns"]["E2"].value == "c"

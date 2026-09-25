@@ -36,9 +36,11 @@ The Generate tab is **export-only** — it never writes to Unity Catalog.
   **Export Excel** button on the Assess tab.
 - **Generate tab** (`GenerateWizard.tsx`, `POST /api/generate/stream` →
   `GET /api/generate/excel/{token}`) — drafts the missing metadata via the workspace model
-  picker and downloads a workbook with `Catalog`, `Schema`, `Entity`,
+  picker and downloads a workbook with `Catalog`, `Schema`, `Entity`, `Entity_Columns`,
   `Relationship_PrimaryKey`, `Relationship_ForeignKey`, `GenieAgent` and `MetricViews` tabs.
-  PK/FK suggestions are heuristic — review before applying.
+  Every catalog, schema, entity and column is a **separate, grounded LLM call** (never a
+  batch the model has to echo names back from), so one item's failure or rewording can
+  never blank another item's fields. PK/FK suggestions are heuristic — review before applying.
 
 > **Note on Pages:** Genie Ontology *Pages* are a gated preview with no public list API, so
 > Page coverage is reported as "not assessable" rather than a misleading zero.

@@ -192,12 +192,18 @@ def build_generation_workbook(payload: dict) -> io.BytesIO:
            widths=[18, 24, 24, 60, 30], wrap_last=True)
 
     _sheet(wb, "Entity",
-           ["Pillar", "Catalog", "Schema", "Entity", "Column",
-            "Entity_Description_Generated", "Entity_Tag_Generated", "Column_Comment_Generated"],
-           [[r.get("pillar"), r.get("catalog"), r.get("schema"), r.get("entity"), r.get("column"),
-             r.get("entity_description"), r.get("entity_tag"), r.get("column_comment")]
+           ["Pillar", "Catalog", "Schema", "Entity",
+            "Entity_Description_Generated", "Entity_Tag_Generated"],
+           [[r.get("pillar"), r.get("catalog"), r.get("schema"), r.get("entity"),
+             r.get("entity_description"), r.get("entity_tag")]
             for r in p.get("entity", [])],
-           widths=[16, 20, 20, 24, 22, 48, 24, 48], wrap_last=True)
+           widths=[16, 20, 20, 24, 60, 30], wrap_last=True)
+
+    _sheet(wb, "Entity_Columns",
+           ["Catalog", "Schema", "Entity", "Column", "Column_Comments_Generated"],
+           [[r.get("catalog"), r.get("schema"), r.get("entity"), r.get("column"), r.get("column_comment")]
+            for r in p.get("entity_columns", [])],
+           widths=[20, 20, 24, 22, 60], wrap_last=True)
 
     _sheet(wb, "Relationship_PrimaryKey",
            ["Catalog", "Schema", "Parent_Entity", "Column_Name", "Constraint_Type", "Statement"],
