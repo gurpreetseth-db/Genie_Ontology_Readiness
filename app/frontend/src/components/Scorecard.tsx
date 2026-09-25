@@ -14,6 +14,7 @@ import {
 } from 'recharts';
 import { ChevronDown, RefreshCw, AlertTriangle, TrendingUp, Play, Gauge as GaugeIcon, Loader2, Sparkles, ListChecks, History, Plus, Server, Download, FileDown, GitCompareArrows, Sheet } from 'lucide-react';
 import { apiGet, streamPostEvents, apiPostBlob, saveBlob } from '../hooks/useApi';
+import type { WorkspaceScope } from '../hooks/useWorkspaceScope';
 import type {
   AppConfig,
   Scorecard as ScorecardType,
@@ -24,11 +25,6 @@ import type {
   HistoryResponse,
   HistorySnapshot,
   SnapshotResponse,
-  WorkspaceInfo,
-  WorkspaceFilterValue,
-  WorkspacesResponse,
-  CatalogInfo,
-  CatalogsResponse,
 } from '../types';
 import { levelStyle, scoreColor } from '../theme/levels';
 import { downloadAllZip } from '../utils/exportAll';
@@ -138,11 +134,19 @@ export default function Scorecard({
   config,
   scorecard,
   setScorecard,
+  scope,
 }: {
   config: AppConfig;
   scorecard: ScorecardType | null;
   setScorecard: (s: ScorecardType) => void;
+  // Workspace + catalog scope — owned by AppShell and shared with the Generate tab,
+  // so picking catalogs here also scopes Generate (and vice versa) without having
+  // to reselect per tab. Activity-based signals count within the deployed
+  // workspace only (#25/#10); the workspace itself is shown as a read-only label
+  // (scope.scopedWorkspaceName), not a picker — only catalogs are interactive.
+  scope: WorkspaceScope;
 }) {
+  const { wsFilter, catalogs, catalogsAvailable, catalogsLoading, catFilter, setCatFilter, scopedWorkspaceName } = scope;
   const [phase, setPhase] = useState<'idle' | 'running' | 'done'>(scorecard ? 'done' : 'idle');
   const [progressByKey, setProgressByKey] = useState<Record<string, string>>({});
   const [pillarsByKey, setPillarsByKey] = useState<Record<string, PillarScore>>(() =>
@@ -156,20 +160,6 @@ export default function Scorecard({
   const [currentId, setCurrentId] = useState<number | null>(null);
   const [loadingId, setLoadingId] = useState<number | null>(null);
   const abortRef = useRef<AbortController | null>(null);
-
-  // Workspace scope (#25/#10): activity-based signals count within the deployed
-  // workspace only, so they're never account-wide. The scope is fixed to the
-  // deployed workspace (shown as a read-only label); users scope catalogs instead.
-  const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([]);
-  const [wsFilter, setWsFilter] = useState<WorkspaceFilterValue>(
-    config.workspace_id ? { mode: 'include', workspace_ids: [config.workspace_id] } : { mode: 'include', workspace_ids: [] }
-  );
-  // Catalog filter: options depend on the selected workspaces (bindings), refetched
-  // when the workspace selection changes. Value = selected catalog names ([] = all).
-  const [catalogs, setCatalogs] = useState<CatalogInfo[]>([]);
-  const [catalogsAvailable, setCatalogsAvailable] = useState(true);
-  const [catalogsLoading, setCatalogsLoading] = useState(false);
-  const [catFilter, setCatFilter] = useState<string[]>([]);
   const [zipBusy, setZipBusy] = useState(false);
   const [pdfBusy, setPdfBusy] = useState(false);
   const [xlsxBusy, setXlsxBusy] = useState(false);
@@ -275,43 +265,8 @@ export default function Scorecard({
 
   useEffect(() => {
     refreshHistory();
-    apiGet<WorkspacesResponse>('/workspaces')
-      .then((r) => {
-        setWorkspaces(r.workspaces || []);
-        // Seed the default selection to the current workspace if the config didn't.
-        if (!config.workspace_id && r.current_workspace_id) {
-          setWsFilter({ mode: 'include', workspace_ids: [r.current_workspace_id] });
-        }
-      })
-      .catch(() => {});
     return () => abortRef.current?.abort();
   }, []);
-
-  // Refetch the catalog options whenever the workspace selection changes, so the
-  // catalog filter always reflects the catalogs bound to the chosen workspaces.
-  useEffect(() => {
-    const include = wsFilter.mode === 'include' && wsFilter.workspace_ids.length > 0;
-    const qs = include
-      ? `?workspace_ids=${encodeURIComponent(wsFilter.workspace_ids.join(','))}&mode=include`
-      : `?mode=${wsFilter.mode}`;
-    setCatalogsLoading(true);
-    apiGet<CatalogsResponse>(`/catalogs${qs}`)
-      .then((r) => {
-        setCatalogs(r.catalogs || []);
-        setCatalogsAvailable(r.available);
-        setCatFilter([]); // reset to no filter (empty = assess all) for the new workspace scope
-      })
-      .catch(() => { setCatalogs([]); setCatalogsAvailable(false); })
-      .finally(() => setCatalogsLoading(false));
-  }, [wsFilter]);
-
-  // The workspace the assessment is scoped to (the deployed workspace). Shown as a
-  // read-only label in place of a picker.
-  const scopedWorkspaceName = useMemo(() => {
-    const id = wsFilter.workspace_ids[0];
-    const w = workspaces.find((ws) => ws.is_current) || (id ? workspaces.find((ws) => ws.id === id) : undefined);
-    return w?.name || id || null;
-  }, [workspaces, wsFilter]);
 
   const scopedWorkspaceLabel = (
     <span className="inline-flex items-center gap-1.5 rounded-md border border-gray-200 bg-gray-50 px-2.5 py-1.5 text-xs text-ink-600 max-w-[240px]">

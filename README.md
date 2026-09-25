@@ -41,6 +41,18 @@ The Generate tab is **export-only** — it never writes to Unity Catalog.
   Every catalog, schema, entity and column is a **separate, grounded LLM call** (never a
   batch the model has to echo names back from), so one item's failure or rewording can
   never blank another item's fields. PK/FK suggestions are heuristic — review before applying.
+  Generation is resilient to how the model actually replies: a **case/alias-tolerant field
+  lookup** (a capitalized `"Description"` or renamed `"desc"` key still reads correctly), a
+  **one-shot retry with a stricter reminder** when a reply isn't valid JSON, and generous
+  `max_tokens` per call-type so a reply isn't truncated before its JSON closes. Any item that
+  still comes back blank after both attempts is counted and surfaced in the completion
+  banner ("N items could not be generated — see the app logs for why") instead of failing
+  silently.
+- **Shared workspace + catalog scope** (`hooks/useWorkspaceScope.ts`, owned by `AppShell` in
+  `App.tsx`) — pick catalogs **once** and it applies to both the Assess and Generate tabs
+  (Plan needs no scope of its own; it works off whatever scorecard Assess already produced).
+  Previously each tab held its own independent copy and re-fetched `/workspaces` +
+  `/catalogs` separately, so a catalog selection on one tab had no effect on the other.
 
 > **Note on Pages:** Genie Ontology *Pages* are a gated preview with no public list API, so
 > Page coverage is reported as "not assessable" rather than a misleading zero.

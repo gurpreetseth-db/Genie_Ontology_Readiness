@@ -65,11 +65,10 @@ class GenerateRequest(BaseModel):
     catalogs: list[str] = []
 
 
-async def _llm_json(model: str, system: str, user: str, max_tokens: int = 1200, _what: str = ""):
-    """Run one FM API completion and parse a JSON object/array from the reply.
-    Returns None on any failure (the caller degrades that row to a blank suggestion).
-    Every failure is logged with the model + a truncated snippet of what came back, so a
-    blank field in the workbook is diagnosable from the app log rather than silent."""
+async def _complete(model: str, system: str, user: str, max_tokens: int, _what: str) -> Optional[str]:
+    """Run one FM API completion, return the concatenated content text (possibly
+    empty), or None on a transport/upstream-error failure. Logged so a blank field
+    is diagnosable from the app log."""
     parts = []
     try:
         async for chunk in stream_llm_chat(
@@ -95,11 +94,16 @@ async def _llm_json(model: str, system: str, user: str, max_tokens: int = 1200, 
     except Exception as e:
         logger.warning(f"generate: LLM completion failed for {_what or 'item'} (model={model}): {str(e)[:160]}")
         return None
-    text = "".join(parts).strip()
+    return "".join(parts).strip()
+
+
+def _extract_json(text: str):
+    """Best-effort JSON object/array extraction from free-form model text: strip a
+    ``` fence if present, then take the outer {..} or [..] span. Models routinely
+    add a preamble ("Sure, here's the JSON:") or wrap the reply in a code fence
+    despite being told not to — this tolerates both."""
     if not text:
-        logger.warning(f"generate: empty LLM reply for {_what or 'item'} (model={model})")
         return None
-    # Strip ``` fences and locate the JSON payload.
     if text.startswith("```"):
         text = text.strip("`")
         text = text[text.find("\n") + 1:] if "\n" in text else text
@@ -110,9 +114,80 @@ async def _llm_json(model: str, system: str, user: str, max_tokens: int = 1200, 
                 return json.loads(text[i:j + 1])
             except Exception:
                 pass
-    logger.warning(f"generate: could not parse JSON for {_what or 'item'} (model={model}); "
-                   f"reply started with: {text[:160]!r}")
     return None
+
+
+_JSON_ONLY_REMINDER = (
+    "\n\nYour previous reply did not contain a single valid JSON object and could not be used. "
+    "Reply again with ONLY the JSON object — no markdown code fences, no explanation, nothing "
+    "before or after it."
+)
+
+
+async def _llm_json(model: str, system: str, user: str, max_tokens: int = 1200, _what: str = ""):
+    """Run an FM API completion and parse a JSON object/array from the reply,
+    retrying ONCE with a stricter reminder if the first reply wasn't valid JSON —
+    models routinely add a preamble or wrap the JSON in prose despite explicit
+    instructions not to, and a low max_tokens can also truncate the JSON before it
+    closes. A transport/upstream error is NOT retried (already logged, and an
+    immediate retry won't fix an outage). Returns None if every attempt fails;
+    every failure is logged with the model + a truncated snippet."""
+    prompt = user
+    for attempt in range(2):
+        text = await _complete(model, system, prompt, max_tokens, _what)
+        if text is None:
+            return None
+        if text:
+            parsed = _extract_json(text)
+            if parsed is not None:
+                return parsed
+            logger.warning(f"generate: could not parse JSON for {_what or 'item'} "
+                           f"(model={model}, attempt {attempt + 1}); reply started with: {text[:160]!r}")
+        else:
+            logger.warning(f"generate: empty LLM reply for {_what or 'item'} "
+                           f"(model={model}, attempt {attempt + 1})")
+        prompt = user + _JSON_ONLY_REMINDER
+    return None
+
+
+def _norm_keys(data) -> dict:
+    return {str(k).strip().lower(): v for k, v in data.items()} if isinstance(data, dict) else {}
+
+
+def _pick_str(data: dict, *keys: str) -> str:
+    """Case/whitespace-tolerant field lookup. Despite explicit "use exactly this
+    lowercase key" instructions, models sometimes still capitalize a JSON key
+    ("Description") or rename it ("desc") — a strict `data.get("description")`
+    would then read as permanently blank even though the model DID answer. Tries
+    each candidate key (in priority order), matched case-insensitively."""
+    norm = _norm_keys(data)
+    for k in keys:
+        v = norm.get(k.strip().lower())
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _pick_dict(data: dict, *keys: str) -> dict:
+    norm = _norm_keys(data)
+    for k in keys:
+        v = norm.get(k.strip().lower())
+        if isinstance(v, dict):
+            return v
+    return {}
+
+
+def _pick_column_comment(comments: dict, column: str) -> str:
+    """Column-name lookup inside a model-returned {column: comment} map, tolerant
+    of the model changing the column name's case in its reply."""
+    if not isinstance(comments, dict):
+        return ""
+    v = comments.get(column)
+    if isinstance(v, str) and v.strip():
+        return v.strip()
+    low = {str(k).strip().lower(): val for k, val in comments.items()}
+    v = low.get(column.strip().lower())
+    return v.strip() if isinstance(v, str) and v.strip() else ""
 
 
 async def _entity_columns(s: dict, keys: set[tuple]) -> dict[tuple, list[str]]:
@@ -176,9 +251,21 @@ def _fk_links(cat: str, sch: str, entity: str, cols: list[str],
     return links
 
 
-_SYS_META = ("You are a Databricks Unity Catalog metadata expert preparing an estate for "
-             "Genie Ontology. Write concise, business-meaningful descriptions and a single "
-             "lower_snake_case governed tag value. Reply with STRICT JSON only, no prose.")
+_SYS_META = (
+    "You are a Databricks Unity Catalog metadata expert preparing an estate for Genie "
+    "Ontology. You are given the name of a catalog, schema, table, or column plus its real "
+    "child metadata (schema/table/column names) — ground your answer in that metadata, not "
+    "just the name.\n\n"
+    "Output rules — follow exactly, every time:\n"
+    "1. Reply with ONLY a single JSON object: no markdown code fences, no preamble, no "
+    "explanation, nothing before or after the JSON.\n"
+    "2. Use EXACTLY the lowercase field names given in the user's requested schema — do not "
+    "capitalize, translate, rename, or add fields.\n"
+    "3. A value that spans multiple lines (e.g. SQL) must use escaped \\n sequences — never a "
+    "raw line break inside a JSON string, or the JSON becomes invalid.\n"
+    "Example of a correctly formatted reply (field names will vary by request): "
+    '{"description": "Stores customer order history.", "tag": "sales"}'
+)
 
 
 async def _gen_catalog_item(model, sem, cat, pillar, schema_names):
@@ -192,9 +279,9 @@ async def _gen_catalog_item(model, sem, cat, pillar, schema_names):
                 "schemas, write a business-meaningful description and a governed tag. "
                 'Return STRICT JSON {"description": "<one business sentence>", '
                 '"tag": "<one lower_snake_case governed tag value>"}.')
-        data = await _llm_json(model, _SYS_META, user, max_tokens=400, _what=f"catalog {cat}") or {}
+        data = await _llm_json(model, _SYS_META, user, max_tokens=600, _what=f"catalog {cat}") or {}
         return {"pillar": pillar, "catalog": cat,
-                "description": data.get("description", ""), "tag": data.get("tag", "")}
+                "description": _pick_str(data, "description"), "tag": _pick_str(data, "tag", "governed_tag")}
 
 
 async def _gen_schema_item(model, sem, cat, sch, pillar, entity_names):
@@ -205,9 +292,9 @@ async def _gen_schema_item(model, sem, cat, sch, pillar, entity_names):
                 "tables, write a business-meaningful description and a governed tag. "
                 'Return STRICT JSON {"description": "<one business sentence>", '
                 '"tag": "<one lower_snake_case governed tag value>"}.')
-        data = await _llm_json(model, _SYS_META, user, max_tokens=400, _what=f"schema {cat}.{sch}") or {}
+        data = await _llm_json(model, _SYS_META, user, max_tokens=700, _what=f"schema {cat}.{sch}") or {}
         return {"pillar": pillar, "catalog": cat, "schema": sch,
-                "description": data.get("description", ""), "tag": data.get("tag", "")}
+                "description": _pick_str(data, "description"), "tag": _pick_str(data, "tag", "governed_tag")}
 
 
 async def _gen_entity(model, sem, cat, sch, ent, pillar, cols):
@@ -222,13 +309,15 @@ async def _gen_entity(model, sem, cat, sch, ent, pillar, cols):
                 'column. Return STRICT JSON {"description": "<one business sentence>", '
                 '"tag": "<one lower_snake_case governed tag value>", '
                 '"columns": {"<column>": "<short business comment>"}}.')
-        data = await _llm_json(model, _SYS_META, user, max_tokens=1400, _what=f"entity {cat}.{sch}.{ent}") or {}
-        desc, tag = data.get("description", ""), data.get("tag", "")
-        comments = data.get("columns", {}) if isinstance(data.get("columns"), dict) else {}
+        data = await _llm_json(model, _SYS_META, user, max_tokens=2200, _what=f"entity {cat}.{sch}.{ent}") or {}
+        desc = _pick_str(data, "description")
+        tag = _pick_str(data, "tag", "governed_tag")
+        comments = _pick_dict(data, "columns", "column_comments", "comments")
         entity_row = {"pillar": pillar, "catalog": cat, "schema": sch, "entity": ent,
                       "entity_description": desc, "entity_tag": tag}
         column_rows = [
-            {"catalog": cat, "schema": sch, "entity": ent, "column": c, "column_comment": comments.get(c, "")}
+            {"catalog": cat, "schema": sch, "entity": ent, "column": c,
+             "column_comment": _pick_column_comment(comments, c)}
             for c in cols
         ]
         return entity_row, column_rows
@@ -239,8 +328,8 @@ async def _gen_agent(model, sem, name, sid):
         user = (f'Draft concise, high-quality Genie space instructions for the agent "{name}". '
                 "Cover: the business domain, key metrics and their definitions, join guidance, "
                 "and answer style. Return STRICT JSON {\"instructions\": \"<text>\"}.")
-        data = await _llm_json(model, _SYS_META, user, max_tokens=900, _what=f"genie agent {name}") or {}
-        return {"name": name, "space_id": sid, "instructions": data.get("instructions", "")}
+        data = await _llm_json(model, _SYS_META, user, max_tokens=1200, _what=f"genie agent {name}") or {}
+        return {"name": name, "space_id": sid, "instructions": _pick_str(data, "instructions")}
 
 
 async def _gen_metric_view(model, sem, cat, sch, entities_summary):
@@ -249,8 +338,8 @@ async def _gen_metric_view(model, sem, cat, sch, entities_summary):
                 f"tables/columns: {json.dumps(entities_summary)[:4000]}. Return STRICT JSON "
                 '{"text": "<CREATE VIEW ... WITH METRICS LANGUAGE YAML ... $$ ... $$>"} with '
                 "sensible measures and dimensions. Use fully-qualified names.")
-        data = await _llm_json(model, _SYS_META, user, max_tokens=1500, _what=f"metric view {cat}.{sch}") or {}
-        return {"catalog": cat, "schema": sch, "text": data.get("text", "")}
+        data = await _llm_json(model, _SYS_META, user, max_tokens=2200, _what=f"metric view {cat}.{sch}") or {}
+        return {"catalog": cat, "schema": sch, "text": _pick_str(data, "text", "sql", "ddl")}
 
 
 async def _generate(detail: dict, s: dict, model: str, emit):

@@ -48,6 +48,26 @@ async def _stream_entity(*_a, **_k):
     yield "data: [DONE]\n\n"
 
 
+async def _stream_prose_only(*_a, **_k):
+    """A reply with no JSON at all — the model ignored the format instruction
+    entirely, on every attempt."""
+    yield _sse("I'm not able to provide that right now, sorry.")
+    yield "data: [DONE]\n\n"
+
+
+async def _stream_recovers_on_retry(messages, *_a, **_k):
+    """First attempt: unparsable prose. Second attempt (after _llm_json appends
+    the stricter JSON-only reminder to the user message): valid JSON. Proves the
+    retry-with-correction path actually recovers a model that ignored the format
+    instruction the first time."""
+    user_content = messages[1]["content"] if len(messages) > 1 else ""
+    if "did not contain a single valid JSON object" in user_content:
+        yield _sse(json.dumps({"description": "Recovered on retry.", "tag": "sales"}))
+    else:
+        yield _sse("Sure! Here's some information, but not in JSON form.")
+    yield "data: [DONE]\n\n"
+
+
 class LlmJsonTest(unittest.IsolatedAsyncioTestCase):
     async def test_parses_plain_object(self):
         with patch.object(gen, "stream_llm_chat", _stream_ok):
@@ -63,6 +83,43 @@ class LlmJsonTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(gen, "stream_llm_chat", _stream_error):
             result = await gen._llm_json("model", "sys", "user")
         self.assertIsNone(result)
+
+    async def test_retries_once_with_stricter_reminder_and_recovers(self):
+        with patch.object(gen, "stream_llm_chat", _stream_recovers_on_retry):
+            result = await gen._llm_json("model", "sys", "user prompt")
+        self.assertEqual(result, {"description": "Recovered on retry.", "tag": "sales"})
+
+    async def test_gives_up_after_two_failed_attempts(self):
+        with patch.object(gen, "stream_llm_chat", _stream_prose_only):
+            result = await gen._llm_json("model", "sys", "user prompt")
+        self.assertIsNone(result)
+
+
+class PickHelpersTest(unittest.TestCase):
+    """The tolerant field lookups that stand in for a strict dict.get(): a model
+    that capitalizes a key ("Description") or renames it ("desc") must not read as
+    permanently blank."""
+
+    def test_pick_str_matches_case_insensitively_and_trims(self):
+        self.assertEqual(gen._pick_str({"Description": "  Hello.  "}, "description"), "Hello.")
+        self.assertEqual(gen._pick_str({"tag": "sales"}, "tag", "governed_tag"), "sales")
+
+    def test_pick_str_falls_through_alias_list(self):
+        self.assertEqual(gen._pick_str({"governed_tag": "sales"}, "tag", "governed_tag"), "sales")
+
+    def test_pick_str_blank_or_missing_returns_empty(self):
+        self.assertEqual(gen._pick_str({}, "description"), "")
+        self.assertEqual(gen._pick_str({"description": "   "}, "description"), "")
+
+    def test_pick_dict_matches_case_insensitively(self):
+        self.assertEqual(gen._pick_dict({"Columns": {"a": "x"}}, "columns"), {"a": "x"})
+        self.assertEqual(gen._pick_dict({}, "columns"), {})
+
+    def test_pick_column_comment_case_insensitive_column_name(self):
+        self.assertEqual(gen._pick_column_comment({"AMOUNT": "The order total."}, "amount"),
+                         "The order total.")
+        self.assertEqual(gen._pick_column_comment({"amount": "  "}, "amount"), "")
+        self.assertEqual(gen._pick_column_comment({}, "amount"), "")
 
 
 class PerItemGenerationTest(unittest.IsolatedAsyncioTestCase):

@@ -1,14 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Wand2, Play, Loader2, AlertTriangle, Sheet, CheckCircle2, Server, Sparkles } from 'lucide-react';
-import { apiGet, streamPostEvents, downloadPath } from '../hooks/useApi';
-import type {
-  AppConfig,
-  CatalogInfo,
-  CatalogsResponse,
-  WorkspaceFilterValue,
-  WorkspaceInfo,
-  WorkspacesResponse,
-} from '../types';
+import { streamPostEvents, downloadPath } from '../hooks/useApi';
+import type { WorkspaceScope } from '../hooks/useWorkspaceScope';
 import CatalogFilter from './CatalogFilter';
 
 // Stages the backend emits progress for, in the order they run.
@@ -39,25 +32,18 @@ const FAILURE_LABELS: Record<string, string> = {
 type Progress = { done: number; total: number };
 
 export default function GenerateWizard({
-  config,
   model,
   active,
+  scope,
 }: {
-  config: AppConfig;
   model: string;
   active: boolean;
+  // Shared with the Assess tab (owned by AppShell) — the same workspace/catalog
+  // selection, so scoping catalogs here (or on Assess) applies to both without
+  // reselecting per tab.
+  scope: WorkspaceScope;
 }) {
-  const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([]);
-  const [wsFilter] = useState<WorkspaceFilterValue>(
-    config.workspace_id
-      ? { mode: 'include', workspace_ids: [config.workspace_id] }
-      : { mode: 'include', workspace_ids: [] }
-  );
-  const [catalogs, setCatalogs] = useState<CatalogInfo[]>([]);
-  const [catalogsAvailable, setCatalogsAvailable] = useState(true);
-  const [catalogsLoading, setCatalogsLoading] = useState(false);
-  const [catFilter, setCatFilter] = useState<string[]>([]);
-
+  const { wsFilter, catalogs, catalogsAvailable, catalogsLoading, catFilter, setCatFilter, scopedWorkspaceName } = scope;
   const [phase, setPhase] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
   const [progress, setProgress] = useState<Record<string, Progress>>({});
   const [token, setToken] = useState<string | null>(null);
@@ -67,25 +53,8 @@ export default function GenerateWizard({
   const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
-    apiGet<WorkspacesResponse>('/workspaces').then((r) => setWorkspaces(r.workspaces || [])).catch(() => {});
     return () => abortRef.current?.abort();
   }, []);
-
-  useEffect(() => {
-    const include = wsFilter.mode === 'include' && wsFilter.workspace_ids.length > 0;
-    const qs = include
-      ? `?workspace_ids=${encodeURIComponent(wsFilter.workspace_ids.join(','))}&mode=include`
-      : `?mode=${wsFilter.mode}`;
-    setCatalogsLoading(true);
-    apiGet<CatalogsResponse>(`/catalogs${qs}`)
-      .then((r) => { setCatalogs(r.catalogs || []); setCatalogsAvailable(r.available); })
-      .catch(() => { setCatalogs([]); setCatalogsAvailable(false); })
-      .finally(() => setCatalogsLoading(false));
-  }, [wsFilter]);
-
-  const scopedWorkspaceName =
-    (workspaces.find((w) => w.is_current) || workspaces.find((w) => w.id === wsFilter.workspace_ids[0]))?.name ||
-    wsFilter.workspace_ids[0] || null;
 
   async function run() {
     if (phase === 'running') return;

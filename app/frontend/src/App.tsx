@@ -9,7 +9,8 @@ import {
   Wand2,
 } from 'lucide-react';
 import { useConfig } from './hooks/useConfig';
-import type { Scorecard as ScorecardType } from './types';
+import { useWorkspaceScope } from './hooks/useWorkspaceScope';
+import type { AppConfig, Scorecard as ScorecardType } from './types';
 import Scorecard from './components/Scorecard';
 import CapabilityExplainer from './components/CapabilityExplainer';
 import PlanWizard from './components/PlanWizard';
@@ -29,21 +30,6 @@ const TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
 
 export default function App() {
   const { config, error, loading } = useConfig();
-  const [tab, setTab] = useState<Tab>('assess');
-  const [model, setModel] = useState<string>('');
-  const [modelPickerOpen, setModelPickerOpen] = useState(false);
-  const [scorecard, setScorecard] = useState<ScorecardType | null>(null);
-  // Mount PlanWizard on first Plan visit and keep it mounted (hidden when
-  // inactive) so its conversation + generated plan persist across tab switches.
-  const [planMounted, setPlanMounted] = useState(false);
-  // Same mount-and-keep treatment for Generate, so an in-progress run + its
-  // download link persist across tab switches.
-  const [generateMounted, setGenerateMounted] = useState(false);
-
-  useEffect(() => {
-    if (tab === 'plan') setPlanMounted(true);
-    if (tab === 'generate') setGenerateMounted(true);
-  }, [tab]);
 
   if (loading) {
     return (
@@ -64,6 +50,34 @@ export default function App() {
       </div>
     );
   }
+
+  // AppShell is only ever mounted once `config` is loaded, so useWorkspaceScope
+  // always sees the real deploy-time workspace_id on its first render — no
+  // stale-closure risk from mounting while config is still null.
+  return <AppShell config={config} />;
+}
+
+function AppShell({ config }: { config: AppConfig }) {
+  const [tab, setTab] = useState<Tab>('assess');
+  const [model, setModel] = useState<string>('');
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  const [scorecard, setScorecard] = useState<ScorecardType | null>(null);
+  // Mount PlanWizard on first Plan visit and keep it mounted (hidden when
+  // inactive) so its conversation + generated plan persist across tab switches.
+  const [planMounted, setPlanMounted] = useState(false);
+  // Same mount-and-keep treatment for Generate, so an in-progress run + its
+  // download link persist across tab switches.
+  const [generateMounted, setGenerateMounted] = useState(false);
+
+  // Workspace + catalog scope, selected ONCE here and shared by Assess and
+  // Generate (Plan needs no scope UI of its own — it works off the scorecard
+  // Assess already produced under whatever scope was active).
+  const scope = useWorkspaceScope(config);
+
+  useEffect(() => {
+    if (tab === 'plan') setPlanMounted(true);
+    if (tab === 'generate') setGenerateMounted(true);
+  }, [tab]);
 
   const activeModel = model || config.default_model;
   const activeModelLabel = config.ai_models.find((m) => m.id === activeModel)?.label || activeModel;
@@ -124,7 +138,7 @@ export default function App() {
         {/* Keep Scorecard mounted (hidden when inactive) so an in-progress or
             completed run and expanded pillar persist across tab switches. */}
         <div className={tab === 'assess' ? '' : 'hidden'}>
-          <Scorecard config={config} scorecard={scorecard} setScorecard={setScorecard} />
+          <Scorecard config={config} scorecard={scorecard} setScorecard={setScorecard} scope={scope} />
         </div>
         {planMounted && (
           <div className={tab === 'plan' ? '' : 'hidden'}>
@@ -133,7 +147,7 @@ export default function App() {
         )}
         {generateMounted && (
           <div className={tab === 'generate' ? '' : 'hidden'}>
-            <GenerateWizard config={config} model={activeModel} active={tab === 'generate'} />
+            <GenerateWizard model={activeModel} active={tab === 'generate'} scope={scope} />
           </div>
         )}
         {tab === 'learn' && <CapabilityExplainer scorecard={scorecard} />}
