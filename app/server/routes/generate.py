@@ -447,20 +447,29 @@ async def _gen_schema_item(model, sem, cat, sch, pillar, entity_names, catalog_t
                 "description": desc, "usecase": usecase, "quality_tier": tier, "tag": tag}
 
 
-async def _gen_entity(model, sem, cat, sch, ent, pillar, cols, catalog_tag, schema_tag):
+async def _gen_entity(model, sem, cat, sch, ent, pillar, cols, catalog_tag,
+                      schema_quality_tier, schema_usecase):
     """One LLM call per entity: description + table_type + pii + usecase + a
     comment for every listed (uncommented) column. Returns (entity_row,
     column_rows) — kept separate so the Entity sheet stays entity-grain and
     columns land in their own Entity_Columns sheet.
 
-    Entity_Tag_Generated rolls up the parent catalog's tag, the parent schema's
-    tag (each looked up by name in their own already-built sheet; omitted if that
-    ancestor wasn't itself generated), plus `table_type` (dimension/fact/metric —
-    the model's read, backstopped by a naming/column-shape heuristic when the
-    model's answer isn't one of the three), `pii` (true if EITHER the model or a
-    column-name heuristic flags it — errs toward flagging for review), and
-    `usecase` — a SHORT category label (e.g. `customer`, `retail_metrics`),
-    never a descriptive sentence."""
+    Entity_Tag_Generated rolls up NAMED COMPONENTS rather than gluing in whole
+    ancestor tag strings (which used to duplicate `data_product` — it's already
+    inside the schema's own composed tag — and left two anonymous `usecase`
+    pairs indistinguishable from each other):
+      - `catalog_tag` (already "data_product = <value>", or "" if the catalog
+        wasn't itself generated) — included once, verbatim.
+      - `schema_quality_tier` / `schema_usecase` — the SCHEMA's own raw values
+        (not its composed tag string), rendered here as `quality_tier = …` and
+        `schema_usecase = …` so the schema's usecase is never confused with the
+        entity's own.
+      - `table_type` (dimension/fact/metric — the model's read, backstopped by
+        a naming/column-shape heuristic when the model's answer isn't one of
+        the three) and `pii` (true if EITHER the model or a column-name
+        heuristic flags it) — this entity's own.
+      - `entity_usecase` — this entity's own SHORT category label (e.g.
+        `customer`, `retail_metrics`), never a descriptive sentence."""
     async with sem:
         ctx = f" It has columns: {json.dumps(cols)}." if cols else ""
         usecase_ask = _USECASE_ASK.format(noun="this table")
@@ -477,7 +486,7 @@ async def _gen_entity(model, sem, cat, sch, ent, pillar, cols, catalog_tag, sche
                 "'metric' for a semantic/metric view. Comment every listed column.")
         data = await _llm_json(model, _SYS_META, user, _what=f"entity {cat}.{sch}.{ent}") or {}
         desc = _pick_str(data, "description")
-        usecase = _normalize_tag_value(_pick_str(data, "usecase"))
+        entity_usecase = _normalize_tag_value(_pick_str(data, "usecase"))
         comments = _pick_dict(data, "columns", "column_comments", "comments")
 
         table_type = _pick_str(data, "table_type").lower()
@@ -487,11 +496,16 @@ async def _gen_entity(model, sem, cat, sch, ent, pillar, cols, catalog_tag, sche
         pii_llm = _pick_bool(data, "pii")
         pii = bool(pii_llm) or _looks_like_pii(cols)
 
-        tag = _compose_tag(catalog_tag, schema_tag, f"table_type = {table_type}",
-                           f"pii = {'true' if pii else 'false'}",
-                           f"usecase = {usecase}" if usecase else "")
+        tag = _compose_tag(
+            catalog_tag,
+            f"quality_tier = {schema_quality_tier}" if schema_quality_tier else "",
+            f"schema_usecase = {schema_usecase}" if schema_usecase else "",
+            f"table_type = {table_type}",
+            f"pii = {'true' if pii else 'false'}",
+            f"entity_usecase = {entity_usecase}" if entity_usecase else "",
+        )
         entity_row = {"pillar": pillar, "catalog": cat, "schema": sch, "entity": ent,
-                      "entity_description": desc, "usecase": usecase, "entity_tag": tag}
+                      "entity_description": desc, "entity_usecase": entity_usecase, "entity_tag": tag}
         column_rows = [
             {"catalog": cat, "schema": sch, "entity": ent, "column": c,
              "column_comment": _pick_column_comment(comments, c)}
@@ -570,9 +584,12 @@ async def _generate(detail: dict, s: dict, model: str, emit):
                 await emit("schemas", done, len(stasks))
     await emit("schemas", len(fail_schemas), len(fail_schemas))
 
-    # Schema Sheet's OWN generated tag, by (catalog, schema) — same omit-if-absent
-    # rule as above.
-    schema_tag_by_key: dict[tuple, str] = {(r["catalog"], r["schema"]): r["tag"] for r in payload["schema"] if r.get("tag")}
+    # Schema Sheet's OWN generated rows, by (catalog, schema) — the entity's tag
+    # pulls the schema's RAW quality_tier/usecase (not its composed tag string;
+    # that string already has the catalog's data_product baked in, which would
+    # duplicate it in the entity's tag too). Absent if that schema wasn't itself
+    # generated — its pairs are then simply omitted, never fabricated.
+    schema_row_by_key: dict[tuple, dict] = {(r["catalog"], r["schema"]): r for r in payload["schema"]}
 
     # 3. Entities (per-entity LLM; needs column names). Each call returns an
     # entity-grain row plus its own column-grain rows — kept in separate payload
@@ -593,9 +610,10 @@ async def _generate(detail: dict, s: dict, model: str, emit):
     for r in fail_entities:
         k = (r["catalog"], r["schema"], r["entity"])
         cols = failing_cols_by.get(k) or cols_map.get(k, [])
+        sch_row = schema_row_by_key.get((r["catalog"], r["schema"]), {})
         tasks.append(_gen_entity(model, sem, r["catalog"], r["schema"], r["entity"], r.get("pillar", ""), cols,
                                  catalog_tag_by_name.get(r["catalog"], ""),
-                                 schema_tag_by_key.get((r["catalog"], r["schema"]), "")))
+                                 sch_row.get("quality_tier", ""), sch_row.get("usecase", "")))
     done = 0
     for coro in asyncio.as_completed(tasks):
         entity_row, column_rows = await coro
@@ -664,7 +682,7 @@ def _compute_failures(payload: dict) -> dict:
     return {
         "catalog": count(payload.get("catalog", []), "description", "tag"),
         "schema": count(payload.get("schema", []), "description", "usecase"),
-        "entity": count(payload.get("entity", []), "entity_description", "usecase"),
+        "entity": count(payload.get("entity", []), "entity_description", "entity_usecase"),
         "entity_columns": count(payload.get("entity_columns", []), "column_comment"),
         "genie_agent": count(payload.get("genie_agent", []), "instructions"),
         "metric_views": count(payload.get("metric_views", []), "text"),

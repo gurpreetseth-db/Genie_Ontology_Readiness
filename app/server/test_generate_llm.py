@@ -171,7 +171,12 @@ class PerItemGenerationTest(unittest.IsolatedAsyncioTestCase):
             row = await gen._gen_schema_item("model", sem, "main", "bronze_raw", "p", [], "")
         self.assertEqual(row["tag"], "quality_tier = Bronze, usecase = u")
 
-    async def test_entity_generation_rolls_up_ancestor_tags_and_splits_columns(self):
+    async def test_entity_generation_rolls_up_named_components_without_duplicating_data_product(self):
+        """Regression test for the reported duplication: the entity's tag must
+        carry data_product exactly ONCE, and the schema's usecase and the
+        entity's own usecase must be distinguishable (schema_usecase vs
+        entity_usecase) rather than two anonymous, indistinguishable `usecase`
+        pairs."""
         sem = asyncio.Semaphore(2)
         payload = {"description": "Order facts.", "table_type": "fact", "pii": False,
                    "usecase": "customer", "columns": {"amount": "Order amount in USD."}}
@@ -179,17 +184,28 @@ class PerItemGenerationTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(gen, "execute_sql", execute):
             entity_row, column_rows = await gen._gen_entity(
                 "model", sem, "main", "gold_orders", "fact_orders", "sales_pillar", ["amount"],
-                "data_product = sales", "data_product = sales, quality_tier = Gold, usecase = region",
+                "data_product = sales", "Gold", "region",
             )
         self.assertEqual(entity_row["entity_description"], "Order facts.")
-        self.assertEqual(entity_row["usecase"], "customer")
+        self.assertEqual(entity_row["entity_usecase"], "customer")
         self.assertEqual(entity_row["entity_tag"],
-                         "data_product = sales, "
-                         "data_product = sales, quality_tier = Gold, usecase = region, "
-                         "table_type = fact, pii = false, usecase = customer")
+                         "data_product = sales, quality_tier = Gold, schema_usecase = region, "
+                         "table_type = fact, pii = false, entity_usecase = customer")
+        self.assertEqual(entity_row["entity_tag"].count("data_product"), 1)
         self.assertNotIn("column", entity_row)  # Entity sheet is entity-grain only
         self.assertEqual(column_rows, [{"catalog": "main", "schema": "gold_orders", "entity": "fact_orders",
                                         "column": "amount", "column_comment": "Order amount in USD."}])
+
+    async def test_entity_omits_schema_pairs_when_schema_wasnt_generated(self):
+        sem = asyncio.Semaphore(2)
+        payload = {"description": "d", "table_type": "fact", "pii": False, "usecase": "customer", "columns": {}}
+        execute = AsyncMock(return_value=[{"resp": json.dumps(payload)}])
+        with patch.object(gen, "execute_sql", execute):
+            entity_row, _ = await gen._gen_entity(
+                "model", sem, "main", "s1", "orders", "p", [], "data_product = sales", "", ""
+            )
+        self.assertEqual(entity_row["entity_tag"],
+                         "data_product = sales, table_type = fact, pii = false, entity_usecase = customer")
 
     async def test_entity_pii_true_when_column_name_heuristic_fires_even_if_model_says_false(self):
         """pii is an OR of the model's judgment and the column-name heuristic —
@@ -200,7 +216,7 @@ class PerItemGenerationTest(unittest.IsolatedAsyncioTestCase):
         execute = AsyncMock(return_value=[{"resp": json.dumps(payload)}])
         with patch.object(gen, "execute_sql", execute):
             entity_row, _ = await gen._gen_entity(
-                "model", sem, "main", "s1", "customers", "p", ["email_address"], "", ""
+                "model", sem, "main", "s1", "customers", "p", ["email_address"], "", "", ""
             )
         self.assertIn("pii = true", entity_row["entity_tag"])
 
@@ -210,7 +226,7 @@ class PerItemGenerationTest(unittest.IsolatedAsyncioTestCase):
         execute = AsyncMock(return_value=[{"resp": json.dumps(payload)}])
         with patch.object(gen, "execute_sql", execute):
             entity_row, _ = await gen._gen_entity(
-                "model", sem, "main", "s1", "dim_customers", "p", [], "", ""
+                "model", sem, "main", "s1", "dim_customers", "p", [], "", "", ""
             )
         self.assertIn("table_type = dimension", entity_row["entity_tag"])  # from the dim_ prefix, not the model
 
@@ -313,7 +329,7 @@ class ComputeFailuresTest(unittest.TestCase):
             # non-blank (quality_tier alone renders a pair) — the whole point of
             # checking usecase instead of the rendered tag.
             "schema": [{"schema": "s1", "description": "", "usecase": "", "tag": "quality_tier = Bronze"}],
-            "entity": [{"entity": "orders", "entity_description": "d", "usecase": "u",
+            "entity": [{"entity": "orders", "entity_description": "d", "entity_usecase": "u",
                        "entity_tag": "table_type = fact, pii = false"}],
             "entity_columns": [{"column": "amount", "column_comment": ""},
                                {"column": "id", "column_comment": "The primary key."}],
