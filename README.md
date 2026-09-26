@@ -62,12 +62,15 @@ The Generate tab is **export-only** — it never writes to Unity Catalog.
   it). `Catalog_Tag_Generated` is `data_product = <model-generated value>`. `Schema_Tag_Generated`
   rolls up the parent catalog's own generated tag (looked up by catalog name in the Catalog
   sheet — omitted if that catalog wasn't itself generated) plus `quality_tier` (deterministic
-  Bronze/Silver/Gold from medallion-style naming, so it's never blank) and `usecase` (the
-  model's own analysis). `Entity_Tag_Generated` rolls up the catalog's tag, the schema's own
-  tag, plus `table_type` (dimension/fact/metric — the model's read, backstopped by a naming/
-  column-shape heuristic), `pii` (true if *either* the model or a column-name heuristic flags
-  it), and `usecase`. Tables named `__materialization*` (Lakeflow/DLT-internal aliases) are
-  never generated for and never appear in the Entity or Entity_Columns sheets.
+  Bronze/Silver/Gold from medallion-style naming, so it's never blank) and `usecase` — a
+  **short business-domain category label** (1-3 lower_snake_case words, e.g. `customer`,
+  `region`, `date_dimension` — a classification, not a description; normalized defensively if
+  a reply still comes back sentence-shaped). `Entity_Tag_Generated` rolls up the catalog's
+  tag, the schema's own tag, plus `table_type` (dimension/fact/metric — the model's read,
+  backstopped by a naming/column-shape heuristic), `pii` (true if *either* the model or a
+  column-name heuristic flags it), and its own `usecase` category label. Tables named
+  `__materialization*` (Lakeflow/DLT-internal aliases) are never generated for and never
+  appear in the Entity or Entity_Columns sheets.
 - **Shared workspace + catalog scope** (`hooks/useWorkspaceScope.ts`, owned by `AppShell` in
   `App.tsx`) — pick catalogs **once** and it applies to both the Assess and Generate tabs
   (Plan needs no scope of its own; it works off whatever scorecard Assess already produced).

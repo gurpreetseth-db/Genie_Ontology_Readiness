@@ -144,9 +144,12 @@ class PerItemGenerationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["tag"], "")
 
     async def test_schema_item_rolls_up_catalog_tag_plus_quality_tier_and_usecase(self):
+        """Regression test for the reported bug: a model that answers the
+        categorical `usecase` ask with a full sentence must land as a short
+        label in the tag, not the sentence verbatim."""
         sem = asyncio.Semaphore(2)
         execute = AsyncMock(return_value=[
-            {"resp": json.dumps({"description": "Sales schema.", "usecase": "Order analytics."})}
+            {"resp": json.dumps({"description": "Sales schema.", "usecase": "Order analytics for the business."})}
         ])
         with patch.object(gen, "execute_sql", execute):
             row = await gen._gen_schema_item("model", sem, "main", "gold_orders", "sales_pillar",
@@ -154,9 +157,9 @@ class PerItemGenerationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["catalog"], "main")
         self.assertEqual(row["schema"], "gold_orders")
         self.assertEqual(row["description"], "Sales schema.")
-        self.assertEqual(row["usecase"], "Order analytics.")
+        self.assertEqual(row["usecase"], "order_analytics_for_the")  # normalized: first 4 words, lower_snake_case
         self.assertEqual(row["quality_tier"], "Gold")  # from the "gold_" schema name
-        self.assertEqual(row["tag"], "data_product = sales, quality_tier = Gold, usecase = Order analytics.")
+        self.assertEqual(row["tag"], "data_product = sales, quality_tier = Gold, usecase = order_analytics_for_the")
 
     async def test_schema_item_omits_catalog_pair_when_catalog_wasnt_generated(self):
         """If the parent catalog already had governance (so it never appears in
@@ -171,19 +174,19 @@ class PerItemGenerationTest(unittest.IsolatedAsyncioTestCase):
     async def test_entity_generation_rolls_up_ancestor_tags_and_splits_columns(self):
         sem = asyncio.Semaphore(2)
         payload = {"description": "Order facts.", "table_type": "fact", "pii": False,
-                   "usecase": "Revenue reporting.", "columns": {"amount": "Order amount in USD."}}
+                   "usecase": "customer", "columns": {"amount": "Order amount in USD."}}
         execute = AsyncMock(return_value=[{"resp": json.dumps(payload)}])
         with patch.object(gen, "execute_sql", execute):
             entity_row, column_rows = await gen._gen_entity(
                 "model", sem, "main", "gold_orders", "fact_orders", "sales_pillar", ["amount"],
-                "data_product = sales", "data_product = sales, quality_tier = Gold, usecase = Order analytics.",
+                "data_product = sales", "data_product = sales, quality_tier = Gold, usecase = region",
             )
         self.assertEqual(entity_row["entity_description"], "Order facts.")
-        self.assertEqual(entity_row["usecase"], "Revenue reporting.")
+        self.assertEqual(entity_row["usecase"], "customer")
         self.assertEqual(entity_row["entity_tag"],
                          "data_product = sales, "
-                         "data_product = sales, quality_tier = Gold, usecase = Order analytics., "
-                         "table_type = fact, pii = false, usecase = Revenue reporting.")
+                         "data_product = sales, quality_tier = Gold, usecase = region, "
+                         "table_type = fact, pii = false, usecase = customer")
         self.assertNotIn("column", entity_row)  # Entity sheet is entity-grain only
         self.assertEqual(column_rows, [{"catalog": "main", "schema": "gold_orders", "entity": "fact_orders",
                                         "column": "amount", "column_comment": "Order amount in USD."}])
@@ -250,6 +253,24 @@ class TaggingHeuristicsTest(unittest.TestCase):
     def test_compose_tag_drops_blank_pairs(self):
         self.assertEqual(gen._compose_tag("a = 1", "", "b = 2"), "a = 1, b = 2")
         self.assertEqual(gen._compose_tag("", ""), "")
+
+    def test_normalize_tag_value_passes_through_a_real_category_label(self):
+        self.assertEqual(gen._normalize_tag_value("customer"), "customer")
+        self.assertEqual(gen._normalize_tag_value("date_dimension"), "date_dimension")
+        self.assertEqual(gen._normalize_tag_value("Retail Metrics"), "retail_metrics")
+
+    def test_normalize_tag_value_degrades_a_sentence_to_a_short_label(self):
+        """The exact reported bug: usecase came back as a full description
+        instead of a short category. Normalization can't recover the model's
+        intent, but it guarantees the tag never carries a whole sentence."""
+        value = gen._normalize_tag_value("Tracks customer orders and their full purchase history.")
+        self.assertEqual(value, "tracks_customer_orders_and")  # first 4 words only
+        self.assertNotIn(".", value)
+        self.assertNotIn(" ", value)
+
+    def test_normalize_tag_value_blank_or_missing_returns_empty(self):
+        self.assertEqual(gen._normalize_tag_value(""), "")
+        self.assertEqual(gen._normalize_tag_value(None), "")
 
 
 class PickHelpersTest(unittest.TestCase):

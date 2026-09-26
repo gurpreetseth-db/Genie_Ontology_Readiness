@@ -314,6 +314,20 @@ def _compose_tag(*pairs: str) -> str:
     return ", ".join(p for p in pairs if p)
 
 
+def _normalize_tag_value(value: str, max_words: int = 4) -> str:
+    """Coerce a model-returned tag VALUE (data_product, usecase) into a short,
+    lower_snake_case category label — a safety net alongside the prompt
+    instructions, for when the model answers a categorical request ("customer")
+    with a descriptive sentence ("Tracks customer orders and their history.")
+    despite being told not to. Strips trailing punctuation, lowercases, and
+    truncates to the first few words, so a stray sentence degrades to a short
+    label instead of polluting the tag with prose. NOT applied to `description`
+    (meant to be a full sentence) or the fixed-enum fields (table_type,
+    quality_tier, pii)."""
+    words = re.findall(r"[A-Za-z0-9]+", value or "")
+    return "_".join(w.lower() for w in words[:max_words])
+
+
 # --- deterministic PK/FK heuristics ----------------------------------------
 def _pk_column(entity: str, cols: list[str]) -> Optional[str]:
     low = [c.lower() for c in cols]
@@ -368,8 +382,21 @@ _SYS_META = (
     "capitalize, translate, rename, or add fields.\n"
     "3. A value that spans multiple lines (e.g. SQL) must use escaped \\n sequences — never a "
     "raw line break inside a JSON string, or the JSON becomes invalid.\n"
+    "4. Any field asked for as a 'category label' or 'tag value' is a CLASSIFICATION, not a "
+    "description: 1-3 lower_snake_case words (e.g. customer, retail_metrics, region, "
+    "date_dimension), never a sentence and never punctuation. Only a field explicitly asked "
+    "for as a 'sentence' (like description) may be a full sentence.\n"
     "Example of a correctly formatted reply (field names will vary by request): "
     '{"description": "Stores customer order history.", "tag": "sales"}'
+)
+
+# Shared phrasing for every "usecase" ask, so catalog/schema/entity request the
+# SAME short category label — not a description. Reused verbatim so a prompt
+# tweak only has to happen in one place.
+_USECASE_ASK = (
+    'a SHORT business-domain category label for {noun} (1-3 lower_snake_case words, '
+    "e.g. customer, retail_metrics, region, date_dimension, inventory, finance, marketing, "
+    "product_catalog) — a CLASSIFICATION, not a description of what it does"
 )
 
 
@@ -389,7 +416,7 @@ async def _gen_catalog_item(model, sem, cat, pillar, schema_names):
                 'Return STRICT JSON {"description": "<one business sentence>", '
                 '"data_product": "<one lower_snake_case value>"}.')
         data = await _llm_json(model, _SYS_META, user, _what=f"catalog {cat}") or {}
-        data_product = _pick_str(data, "data_product", "tag", "governed_tag")
+        data_product = _normalize_tag_value(_pick_str(data, "data_product", "tag", "governed_tag"))
         return {"pillar": pillar, "catalog": cat,
                 "description": _pick_str(data, "description"),
                 "tag": f"data_product = {data_product}" if data_product else ""}
@@ -402,17 +429,18 @@ async def _gen_schema_item(model, sem, cat, sch, pillar, entity_names, catalog_t
     (`catalog_tag` — looked up by catalog name in the already-built Catalog sheet;
     omitted if that catalog wasn't itself generated, e.g. it already had a real
     description/tag) plus `quality_tier` (deterministic — Bronze/Silver/Gold from
-    medallion-style naming) and `usecase` (the model's own analysis)."""
+    medallion-style naming) and `usecase` — a SHORT category label (e.g.
+    `customer`, `region`), never a descriptive sentence."""
     async with sem:
         ctx = f" It contains tables: {json.dumps(entity_names[:60])}." if entity_names else ""
+        usecase_ask = _USECASE_ASK.format(noun="this schema")
         user = (f"Unity Catalog schema `{cat}.{sch}`.{ctx} Based on the schema name and its "
-                "tables, write a business-meaningful description and one sentence naming the "
-                "business use case this schema supports. "
+                f"tables, write a business-meaningful description and {usecase_ask}. "
                 'Return STRICT JSON {"description": "<one business sentence>", '
-                '"usecase": "<one sentence: the business use case>"}.')
+                '"usecase": "<the short category label>"}.')
         data = await _llm_json(model, _SYS_META, user, _what=f"schema {cat}.{sch}") or {}
         desc = _pick_str(data, "description")
-        usecase = _pick_str(data, "usecase")
+        usecase = _normalize_tag_value(_pick_str(data, "usecase"))
         tier = _quality_tier(cat, sch)
         tag = _compose_tag(catalog_tag, f"quality_tier = {tier}", f"usecase = {usecase}" if usecase else "")
         return {"pillar": pillar, "catalog": cat, "schema": sch,
@@ -431,15 +459,17 @@ async def _gen_entity(model, sem, cat, sch, ent, pillar, cols, catalog_tag, sche
     the model's read, backstopped by a naming/column-shape heuristic when the
     model's answer isn't one of the three), `pii` (true if EITHER the model or a
     column-name heuristic flags it — errs toward flagging for review), and
-    `usecase` (the model's own analysis)."""
+    `usecase` — a SHORT category label (e.g. `customer`, `retail_metrics`),
+    never a descriptive sentence."""
     async with sem:
         ctx = f" It has columns: {json.dumps(cols)}." if cols else ""
+        usecase_ask = _USECASE_ASK.format(noun="this table")
         user = (f"Unity Catalog table `{cat}.{sch}.{ent}`.{ctx} Based on the table name, its "
-                "schema, and its column names, analyze it and return STRICT JSON with these "
-                'exact fields: {"description": "<one business sentence>", '
-                '"table_type": "<dimension, fact, or metric>", '
+                f"schema, and its column names, analyze it. usecase must be {usecase_ask}. "
+                'Return STRICT JSON with these exact fields: {"description": "<one business '
+                'sentence>", "table_type": "<dimension, fact, or metric>", '
                 '"pii": <true or false — true if any column likely holds personal data>, '
-                '"usecase": "<one sentence: the business use case this table supports>", '
+                '"usecase": "<the short category label>", '
                 '"columns": {"<column>": "<short business comment>"}}. '
                 "table_type guidance: 'dimension' for a descriptive/reference entity (a "
                 "business key plus slowly-changing attributes), 'fact' for a "
@@ -447,7 +477,7 @@ async def _gen_entity(model, sem, cat, sch, ent, pillar, cols, catalog_tag, sche
                 "'metric' for a semantic/metric view. Comment every listed column.")
         data = await _llm_json(model, _SYS_META, user, _what=f"entity {cat}.{sch}.{ent}") or {}
         desc = _pick_str(data, "description")
-        usecase = _pick_str(data, "usecase")
+        usecase = _normalize_tag_value(_pick_str(data, "usecase"))
         comments = _pick_dict(data, "columns", "column_comments", "comments")
 
         table_type = _pick_str(data, "table_type").lower()
