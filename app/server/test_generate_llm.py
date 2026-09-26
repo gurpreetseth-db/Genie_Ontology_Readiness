@@ -121,38 +121,135 @@ class LlmJsonTest(unittest.IsolatedAsyncioTestCase):
 
 class PerItemGenerationTest(unittest.IsolatedAsyncioTestCase):
     """Regression coverage for the original batching bug: catalog/schema/entity
-    generation must never depend on the model echoing a name back."""
+    generation must never depend on the model echoing a name back. Also covers
+    the key=value tag format and the ancestor tag rollup (catalog -> schema ->
+    entity), each looked up by name in the already-built sheet."""
 
     async def test_catalog_item_does_not_depend_on_name_echo(self):
         sem = asyncio.Semaphore(2)
-        execute = AsyncMock(return_value=[{"resp": json.dumps({"description": "Sales data.", "tag": "sales"})}])
+        execute = AsyncMock(return_value=[{"resp": json.dumps({"description": "Sales data.", "data_product": "sales"})}])
         with patch.object(gen, "execute_sql", execute):
             row = await gen._gen_catalog_item("model", sem, "main", "sales_pillar", ["s1", "s2"])
         self.assertEqual(row, {"pillar": "sales_pillar", "catalog": "main",
-                               "description": "Sales data.", "tag": "sales"})
+                               "description": "Sales data.", "tag": "data_product = sales"})
 
-    async def test_schema_item_does_not_depend_on_name_echo(self):
+    async def test_catalog_item_blank_data_product_leaves_tag_blank(self):
+        """An empty value must not render as the dangling "data_product = " —
+        that would (a) look broken and (b) mask a real generation failure from
+        _compute_failures, which blank-checks the whole tag field."""
         sem = asyncio.Semaphore(2)
-        execute = AsyncMock(return_value=[{"resp": json.dumps({"description": "Sales data.", "tag": "sales"})}])
+        execute = AsyncMock(return_value=[{"resp": json.dumps({"description": "", "data_product": ""})}])
         with patch.object(gen, "execute_sql", execute):
-            row = await gen._gen_schema_item("model", sem, "main", "s1", "sales_pillar", ["orders"])
-        self.assertEqual(row, {"pillar": "sales_pillar", "catalog": "main", "schema": "s1",
-                               "description": "Sales data.", "tag": "sales"})
+            row = await gen._gen_catalog_item("model", sem, "main", "sales_pillar", [])
+        self.assertEqual(row["tag"], "")
 
-    async def test_entity_generation_splits_entity_and_column_rows(self):
+    async def test_schema_item_rolls_up_catalog_tag_plus_quality_tier_and_usecase(self):
         sem = asyncio.Semaphore(2)
-        payload = {"description": "Order facts.", "tag": "orders",
-                   "columns": {"amount": "Order amount in USD."}}
+        execute = AsyncMock(return_value=[
+            {"resp": json.dumps({"description": "Sales schema.", "usecase": "Order analytics."})}
+        ])
+        with patch.object(gen, "execute_sql", execute):
+            row = await gen._gen_schema_item("model", sem, "main", "gold_orders", "sales_pillar",
+                                             ["orders"], "data_product = sales")
+        self.assertEqual(row["catalog"], "main")
+        self.assertEqual(row["schema"], "gold_orders")
+        self.assertEqual(row["description"], "Sales schema.")
+        self.assertEqual(row["usecase"], "Order analytics.")
+        self.assertEqual(row["quality_tier"], "Gold")  # from the "gold_" schema name
+        self.assertEqual(row["tag"], "data_product = sales, quality_tier = Gold, usecase = Order analytics.")
+
+    async def test_schema_item_omits_catalog_pair_when_catalog_wasnt_generated(self):
+        """If the parent catalog already had governance (so it never appears in
+        the Catalog sheet), the schema's tag must not fabricate a catalog pair —
+        it just carries its own quality_tier/usecase pairs."""
+        sem = asyncio.Semaphore(2)
+        execute = AsyncMock(return_value=[{"resp": json.dumps({"description": "d", "usecase": "u"})}])
+        with patch.object(gen, "execute_sql", execute):
+            row = await gen._gen_schema_item("model", sem, "main", "bronze_raw", "p", [], "")
+        self.assertEqual(row["tag"], "quality_tier = Bronze, usecase = u")
+
+    async def test_entity_generation_rolls_up_ancestor_tags_and_splits_columns(self):
+        sem = asyncio.Semaphore(2)
+        payload = {"description": "Order facts.", "table_type": "fact", "pii": False,
+                   "usecase": "Revenue reporting.", "columns": {"amount": "Order amount in USD."}}
         execute = AsyncMock(return_value=[{"resp": json.dumps(payload)}])
         with patch.object(gen, "execute_sql", execute):
             entity_row, column_rows = await gen._gen_entity(
-                "model", sem, "main", "s1", "orders", "sales_pillar", ["amount"]
+                "model", sem, "main", "gold_orders", "fact_orders", "sales_pillar", ["amount"],
+                "data_product = sales", "data_product = sales, quality_tier = Gold, usecase = Order analytics.",
             )
         self.assertEqual(entity_row["entity_description"], "Order facts.")
-        self.assertEqual(entity_row["entity_tag"], "orders")
+        self.assertEqual(entity_row["usecase"], "Revenue reporting.")
+        self.assertEqual(entity_row["entity_tag"],
+                         "data_product = sales, "
+                         "data_product = sales, quality_tier = Gold, usecase = Order analytics., "
+                         "table_type = fact, pii = false, usecase = Revenue reporting.")
         self.assertNotIn("column", entity_row)  # Entity sheet is entity-grain only
-        self.assertEqual(column_rows, [{"catalog": "main", "schema": "s1", "entity": "orders",
+        self.assertEqual(column_rows, [{"catalog": "main", "schema": "gold_orders", "entity": "fact_orders",
                                         "column": "amount", "column_comment": "Order amount in USD."}])
+
+    async def test_entity_pii_true_when_column_name_heuristic_fires_even_if_model_says_false(self):
+        """pii is an OR of the model's judgment and the column-name heuristic —
+        a model that misses an obvious PII column must not suppress the flag."""
+        sem = asyncio.Semaphore(2)
+        payload = {"description": "d", "table_type": "dimension", "pii": False,
+                   "usecase": "u", "columns": {}}
+        execute = AsyncMock(return_value=[{"resp": json.dumps(payload)}])
+        with patch.object(gen, "execute_sql", execute):
+            entity_row, _ = await gen._gen_entity(
+                "model", sem, "main", "s1", "customers", "p", ["email_address"], "", ""
+            )
+        self.assertIn("pii = true", entity_row["entity_tag"])
+
+    async def test_entity_table_type_falls_back_to_heuristic_when_model_reply_invalid(self):
+        payload = {"description": "d", "table_type": "not-a-real-type", "pii": False, "usecase": "u", "columns": {}}
+        sem = asyncio.Semaphore(2)
+        execute = AsyncMock(return_value=[{"resp": json.dumps(payload)}])
+        with patch.object(gen, "execute_sql", execute):
+            entity_row, _ = await gen._gen_entity(
+                "model", sem, "main", "s1", "dim_customers", "p", [], "", ""
+            )
+        self.assertIn("table_type = dimension", entity_row["entity_tag"])  # from the dim_ prefix, not the model
+
+
+class TaggingHeuristicsTest(unittest.TestCase):
+    """The deterministic pieces that back-stop the LLM: quality_tier and
+    table_type always have a value (never blank, unlike description/tag/usecase,
+    which stay blank on a real generation failure), and pii is a safety-net
+    OR-signal alongside the model's own judgment."""
+
+    def test_quality_tier_from_medallion_naming(self):
+        self.assertEqual(gen._quality_tier("main", "gold_orders"), "Gold")
+        self.assertEqual(gen._quality_tier("main", "silver_orders"), "Silver")
+        self.assertEqual(gen._quality_tier("main", "bronze_orders"), "Bronze")
+        self.assertEqual(gen._quality_tier("main", "orders"), "Bronze")  # no signal -> conservative default
+
+    def test_looks_like_pii_matches_common_pii_column_names(self):
+        self.assertTrue(gen._looks_like_pii(["email_address", "order_id"]))
+        self.assertTrue(gen._looks_like_pii(["date_of_birth"]))
+        self.assertFalse(gen._looks_like_pii(["order_id", "amount", "status"]))
+
+    def test_heuristic_table_type_prefix_wins_over_column_shape(self):
+        self.assertEqual(gen._heuristic_table_type("dim_customers", ["customer_id", "amount"]), "dimension")
+        self.assertEqual(gen._heuristic_table_type("fact_orders", []), "fact")
+        self.assertEqual(gen._heuristic_table_type("mv_revenue", []), "metric")
+
+    def test_heuristic_table_type_column_shape_fallback(self):
+        # No naming prefix: several FK-like columns + a measure column reads as fact.
+        self.assertEqual(
+            gen._heuristic_table_type("orders", ["customer_id", "product_id", "order_amount"]), "fact"
+        )
+        self.assertEqual(gen._heuristic_table_type("customers", ["customer_id", "name"]), "dimension")
+
+    def test_pick_bool_tolerates_string_and_case(self):
+        self.assertIs(gen._pick_bool({"pii": True}, "pii"), True)
+        self.assertIs(gen._pick_bool({"PII": "true"}, "pii"), True)
+        self.assertIs(gen._pick_bool({"pii": "No"}, "pii"), False)
+        self.assertIsNone(gen._pick_bool({}, "pii"))
+
+    def test_compose_tag_drops_blank_pairs(self):
+        self.assertEqual(gen._compose_tag("a = 1", "", "b = 2"), "a = 1, b = 2")
+        self.assertEqual(gen._compose_tag("", ""), "")
 
 
 class PickHelpersTest(unittest.TestCase):
@@ -189,10 +286,14 @@ class ComputeFailuresTest(unittest.TestCase):
 
     def test_counts_blank_rows_per_section(self):
         payload = {
-            "catalog": [{"catalog": "a", "description": "d", "tag": "t"},
+            "catalog": [{"catalog": "a", "description": "d", "tag": "data_product = t"},
                        {"catalog": "b", "description": "", "tag": ""}],
-            "schema": [{"schema": "s1", "description": "", "tag": ""}],
-            "entity": [{"entity": "orders", "entity_description": "d", "entity_tag": "t"}],
+            # Blank description+usecase is a real failure even though `tag` is
+            # non-blank (quality_tier alone renders a pair) — the whole point of
+            # checking usecase instead of the rendered tag.
+            "schema": [{"schema": "s1", "description": "", "usecase": "", "tag": "quality_tier = Bronze"}],
+            "entity": [{"entity": "orders", "entity_description": "d", "usecase": "u",
+                       "entity_tag": "table_type = fact, pii = false"}],
             "entity_columns": [{"column": "amount", "column_comment": ""},
                                {"column": "id", "column_comment": "The primary key."}],
             "genie_agent": [{"name": "Sales", "instructions": ""}],
@@ -211,6 +312,41 @@ class ComputeFailuresTest(unittest.TestCase):
             "catalog": 0, "schema": 0, "entity": 0,
             "entity_columns": 0, "genie_agent": 0, "metric_views": 0,
         })
+
+
+class MaterializationFilterTest(unittest.IsolatedAsyncioTestCase):
+    """__materialization* tables are Lakeflow/DLT-internal materialization
+    aliases, not user-facing tables — must never be generated for, or appear
+    in, the Entity / Entity_Columns sheets."""
+
+    async def test_materialization_tables_are_excluded_from_generation(self):
+        detail = {
+            "catalogs": [], "schemas": [],
+            "entities": [
+                {"catalog": "main", "schema": "gold", "entity": "fact_orders",
+                 "status": "FAIL", "pillar": "p"},
+                {"catalog": "main", "schema": "gold", "entity": "__materialization_mat_abc123",
+                 "status": "FAIL", "pillar": "p"},
+            ],
+            "columns_failing": [], "relationships": [], "genie_agents": {"agents": []},
+        }
+
+        async def _execute(query, parameters=None, record=True):
+            if "ai_query" in query:
+                return [{"resp": json.dumps({"description": "d", "table_type": "fact",
+                                             "pii": False, "usecase": "u", "columns": {}})}]
+            return []  # the _entity_columns query — no columns needed for this test
+
+        async def _noop_emit(stage, done, total):
+            pass
+
+        with patch.object(gen, "execute_sql", AsyncMock(side_effect=_execute)):
+            payload = await gen._generate(detail, {"system_ok": True, "catalogs": []}, "model", _noop_emit)
+
+        entities = [r["entity"] for r in payload["entity"]]
+        self.assertIn("fact_orders", entities)
+        self.assertNotIn("__materialization_mat_abc123", entities)
+        self.assertFalse(any(r["entity"] == "__materialization_mat_abc123" for r in payload["entity_columns"]))
 
 
 if __name__ == "__main__":

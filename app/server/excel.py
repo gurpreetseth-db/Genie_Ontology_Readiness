@@ -180,24 +180,24 @@ def build_generation_workbook(payload: dict) -> io.BytesIO:
     p = payload or {}
 
     _sheet(wb, "Catalog",
-           ["Pillar", "Catalog", "Catalog_Description_Generated", "Catalog_Tag_Generated"],
-           [[r.get("pillar"), r.get("catalog"), r.get("description"), r.get("tag")]
+           ["Catalog", "Catalog_Description_Generated", "Catalog_Tag_Generated"],
+           [[r.get("catalog"), r.get("description"), r.get("tag")]
             for r in p.get("catalog", [])],
-           widths=[18, 28, 60, 30], wrap_last=True)
+           widths=[28, 60, 40], wrap_last=True)
 
     _sheet(wb, "Schema",
-           ["Pillar", "Catalog", "Schema", "Schema_Description_Generated", "Schema_Tag_Generated"],
-           [[r.get("pillar"), r.get("catalog"), r.get("schema"), r.get("description"), r.get("tag")]
+           ["Catalog", "Schema", "Schema_Description_Generated", "Schema_Tag_Generated"],
+           [[r.get("catalog"), r.get("schema"), r.get("description"), r.get("tag")]
             for r in p.get("schema", [])],
-           widths=[18, 24, 24, 60, 30], wrap_last=True)
+           widths=[24, 24, 60, 55], wrap_last=True)
 
     _sheet(wb, "Entity",
-           ["Pillar", "Catalog", "Schema", "Entity",
+           ["Catalog", "Schema", "Entity",
             "Entity_Description_Generated", "Entity_Tag_Generated"],
-           [[r.get("pillar"), r.get("catalog"), r.get("schema"), r.get("entity"),
+           [[r.get("catalog"), r.get("schema"), r.get("entity"),
              r.get("entity_description"), r.get("entity_tag")]
             for r in p.get("entity", [])],
-           widths=[16, 20, 20, 24, 60, 30], wrap_last=True)
+           widths=[20, 20, 24, 60, 65], wrap_last=True)
 
     _sheet(wb, "Entity_Columns",
            ["Catalog", "Schema", "Entity", "Column", "Column_Comments_Generated"],

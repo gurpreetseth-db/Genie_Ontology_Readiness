@@ -29,6 +29,7 @@ model selector still names the actual serving endpoint invoked.
 """
 
 import json
+import re
 import time
 import uuid
 import asyncio
@@ -199,6 +200,24 @@ def _pick_dict(data: dict, *keys: str) -> dict:
     return {}
 
 
+def _pick_bool(data: dict, *keys: str) -> Optional[bool]:
+    """Case-tolerant boolean lookup — the model may reply with a real JSON bool
+    or a string ("true"/"yes"). Returns None (not False) when absent, so callers
+    can tell "the model didn't say" from "the model said no"."""
+    norm = _norm_keys(data)
+    for k in keys:
+        v = norm.get(k.strip().lower())
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in ("true", "yes", "1"):
+                return True
+            if s in ("false", "no", "0"):
+                return False
+    return None
+
+
 def _pick_column_comment(comments: dict, column: str) -> str:
     """Column-name lookup inside a model-returned {column: comment} map, tolerant
     of the model changing the column name's case in its reply."""
@@ -229,6 +248,70 @@ async def _entity_columns(s: dict, keys: set[tuple]) -> dict[tuple, list[str]]:
         if k in keys and r.get("col"):
             out.setdefault(k, []).append(r.get("col"))
     return out
+
+
+# --- deterministic tagging heuristics ---------------------------------------
+# These back-stop the LLM for the tag fields that must always have SOME value
+# (quality_tier, table_type) or benefit from a second, non-LLM signal (pii) —
+# unlike description/tag/usecase, which are purely the model's judgment and stay
+# blank (a real failure signal) if the call didn't produce anything usable.
+
+_GOLD_RE = re.compile(r"(gold|mart|marts|analytics|semantic|presentation|reporting|dwh)", re.I)
+_SILVER_RE = re.compile(r"(silver|clean|curated|conformed|refined)", re.I)
+
+
+def _quality_tier(catalog: str, schema: str) -> str:
+    """Bronze / Silver / Gold, inferred from medallion-style naming — the same
+    gold-layer name pattern the assessment's relationships probe already uses
+    (probes.py's gold_tables query). Always returns one of the three; Bronze is
+    the conservative default when the name carries no layer signal."""
+    name = f"{catalog}.{schema}".lower()
+    if _GOLD_RE.search(name):
+        return "Gold"
+    if _SILVER_RE.search(name):
+        return "Silver"
+    return "Bronze"
+
+
+_PII_COLUMN_RE = re.compile(
+    r"(email|phone|mobile|ssn|social_security|passport|address|street|zip|postal|"
+    r"\bdob\b|date_of_birth|birth_date|full_name|first_name|last_name|maiden_name|"
+    r"credit_card|card_number|\biban\b|tax_id|national_id|driver_license|"
+    r"ip_address|geolocation|\blat\b|\blon\b|\blng\b|salary|income)",
+    re.I,
+)
+
+
+def _looks_like_pii(cols: list[str]) -> bool:
+    """A cheap, deterministic OR-signal alongside the model's own judgment —
+    common PII-shaped column names. Errs toward flagging for review rather than
+    missing a PII column the model's judgment alone might not catch."""
+    return any(_PII_COLUMN_RE.search(c) for c in cols)
+
+
+def _heuristic_table_type(entity: str, cols: list[str]) -> str:
+    """Fallback when the model's table_type isn't one of the three valid values —
+    name-prefix convention first, then a light column-shape signal (several FK-
+    like columns plus at least one measure-like column reads as a fact table)."""
+    name = entity.lower()
+    if name.startswith(("dim_", "d_")):
+        return "dimension"
+    if name.startswith(("fact_", "f_")):
+        return "fact"
+    if name.startswith(("mv_", "metric_")) or "metric_view" in name:
+        return "metric"
+    low_cols = [c.lower() for c in cols]
+    fk_like = sum(1 for c in low_cols if c.endswith(("_id", "_key")))
+    measure_like = sum(1 for c in low_cols
+                       if any(t in c for t in ("amount", "total", "qty", "quantity", "price", "count",
+                                                "revenue", "cost")))
+    return "fact" if fk_like >= 2 and measure_like >= 1 else "dimension"
+
+
+def _compose_tag(*pairs: str) -> str:
+    """Join already-formatted "key = value" pairs (and blank ones are dropped),
+    comma-separated, for the *_Tag_Generated cells."""
+    return ", ".join(p for p in pairs if p)
 
 
 # --- deterministic PK/FK heuristics ----------------------------------------
@@ -294,49 +377,91 @@ async def _gen_catalog_item(model, sem, cat, pillar, schema_names):
     """One LLM call per catalog. Grounded in the catalog's own schema names (a
     "careful review of metadata and its name", not a bare-name guess) — and, unlike
     a batched call, the result is keyed by call site, not by asking the model to
-    echo the name back, so a model-side rewording can never blank every row."""
+    echo the name back, so a model-side rewording can never blank every row.
+
+    Catalog_Tag_Generated is rendered as the single governed pair
+    `data_product = <value>` — the key is fixed; only the value is the model's."""
     async with sem:
         ctx = f" It contains schemas: {json.dumps(schema_names[:40])}." if schema_names else ""
         user = (f"Unity Catalog catalog `{cat}`.{ctx} Based on the catalog name and its "
-                "schemas, write a business-meaningful description and a governed tag. "
+                "schemas, write a business-meaningful description and a short "
+                "lower_snake_case value naming the data product this catalog belongs to. "
                 'Return STRICT JSON {"description": "<one business sentence>", '
-                '"tag": "<one lower_snake_case governed tag value>"}.')
+                '"data_product": "<one lower_snake_case value>"}.')
         data = await _llm_json(model, _SYS_META, user, _what=f"catalog {cat}") or {}
+        data_product = _pick_str(data, "data_product", "tag", "governed_tag")
         return {"pillar": pillar, "catalog": cat,
-                "description": _pick_str(data, "description"), "tag": _pick_str(data, "tag", "governed_tag")}
+                "description": _pick_str(data, "description"),
+                "tag": f"data_product = {data_product}" if data_product else ""}
 
 
-async def _gen_schema_item(model, sem, cat, sch, pillar, entity_names):
-    """One LLM call per schema, grounded in its entity names."""
+async def _gen_schema_item(model, sem, cat, sch, pillar, entity_names, catalog_tag):
+    """One LLM call per schema, grounded in its entity names.
+
+    Schema_Tag_Generated rolls up the parent catalog's OWN generated tag
+    (`catalog_tag` — looked up by catalog name in the already-built Catalog sheet;
+    omitted if that catalog wasn't itself generated, e.g. it already had a real
+    description/tag) plus `quality_tier` (deterministic — Bronze/Silver/Gold from
+    medallion-style naming) and `usecase` (the model's own analysis)."""
     async with sem:
         ctx = f" It contains tables: {json.dumps(entity_names[:60])}." if entity_names else ""
         user = (f"Unity Catalog schema `{cat}.{sch}`.{ctx} Based on the schema name and its "
-                "tables, write a business-meaningful description and a governed tag. "
+                "tables, write a business-meaningful description and one sentence naming the "
+                "business use case this schema supports. "
                 'Return STRICT JSON {"description": "<one business sentence>", '
-                '"tag": "<one lower_snake_case governed tag value>"}.')
+                '"usecase": "<one sentence: the business use case>"}.')
         data = await _llm_json(model, _SYS_META, user, _what=f"schema {cat}.{sch}") or {}
+        desc = _pick_str(data, "description")
+        usecase = _pick_str(data, "usecase")
+        tier = _quality_tier(cat, sch)
+        tag = _compose_tag(catalog_tag, f"quality_tier = {tier}", f"usecase = {usecase}" if usecase else "")
         return {"pillar": pillar, "catalog": cat, "schema": sch,
-                "description": _pick_str(data, "description"), "tag": _pick_str(data, "tag", "governed_tag")}
+                "description": desc, "usecase": usecase, "quality_tier": tier, "tag": tag}
 
 
-async def _gen_entity(model, sem, cat, sch, ent, pillar, cols):
-    """One LLM call per entity: description + tag + a comment for every listed
-    (uncommented) column. Returns (entity_row, column_rows) — kept separate so the
-    Entity sheet stays entity-grain and columns land in their own Entity_Columns sheet."""
+async def _gen_entity(model, sem, cat, sch, ent, pillar, cols, catalog_tag, schema_tag):
+    """One LLM call per entity: description + table_type + pii + usecase + a
+    comment for every listed (uncommented) column. Returns (entity_row,
+    column_rows) — kept separate so the Entity sheet stays entity-grain and
+    columns land in their own Entity_Columns sheet.
+
+    Entity_Tag_Generated rolls up the parent catalog's tag, the parent schema's
+    tag (each looked up by name in their own already-built sheet; omitted if that
+    ancestor wasn't itself generated), plus `table_type` (dimension/fact/metric —
+    the model's read, backstopped by a naming/column-shape heuristic when the
+    model's answer isn't one of the three), `pii` (true if EITHER the model or a
+    column-name heuristic flags it — errs toward flagging for review), and
+    `usecase` (the model's own analysis)."""
     async with sem:
         ctx = f" It has columns: {json.dumps(cols)}." if cols else ""
         user = (f"Unity Catalog table `{cat}.{sch}.{ent}`.{ctx} Based on the table name, its "
-                "schema, and its column names, write a business-meaningful description and a "
-                "governed tag for the table, and a short business comment for every listed "
-                'column. Return STRICT JSON {"description": "<one business sentence>", '
-                '"tag": "<one lower_snake_case governed tag value>", '
-                '"columns": {"<column>": "<short business comment>"}}.')
+                "schema, and its column names, analyze it and return STRICT JSON with these "
+                'exact fields: {"description": "<one business sentence>", '
+                '"table_type": "<dimension, fact, or metric>", '
+                '"pii": <true or false — true if any column likely holds personal data>, '
+                '"usecase": "<one sentence: the business use case this table supports>", '
+                '"columns": {"<column>": "<short business comment>"}}. '
+                "table_type guidance: 'dimension' for a descriptive/reference entity (a "
+                "business key plus slowly-changing attributes), 'fact' for a "
+                "transactional/measurement entity (foreign keys plus numeric measures), "
+                "'metric' for a semantic/metric view. Comment every listed column.")
         data = await _llm_json(model, _SYS_META, user, _what=f"entity {cat}.{sch}.{ent}") or {}
         desc = _pick_str(data, "description")
-        tag = _pick_str(data, "tag", "governed_tag")
+        usecase = _pick_str(data, "usecase")
         comments = _pick_dict(data, "columns", "column_comments", "comments")
+
+        table_type = _pick_str(data, "table_type").lower()
+        if table_type not in ("dimension", "fact", "metric"):
+            table_type = _heuristic_table_type(ent, cols)
+
+        pii_llm = _pick_bool(data, "pii")
+        pii = bool(pii_llm) or _looks_like_pii(cols)
+
+        tag = _compose_tag(catalog_tag, schema_tag, f"table_type = {table_type}",
+                           f"pii = {'true' if pii else 'false'}",
+                           f"usecase = {usecase}" if usecase else "")
         entity_row = {"pillar": pillar, "catalog": cat, "schema": sch, "entity": ent,
-                      "entity_description": desc, "entity_tag": tag}
+                      "entity_description": desc, "usecase": usecase, "entity_tag": tag}
         column_rows = [
             {"catalog": cat, "schema": sch, "entity": ent, "column": c,
              "column_comment": _pick_column_comment(comments, c)}
@@ -391,6 +516,12 @@ async def _generate(detail: dict, s: dict, model: str, emit):
                 await emit("catalogs", done, len(ctasks))
     await emit("catalogs", len(fail_cats), len(fail_cats))
 
+    # Catalog Sheet's OWN generated tag, by catalog name — the ancestor lookup
+    # schemas (and, transitively, entities) roll into their own Tag_Generated.
+    # A catalog that wasn't itself generated (it already had a real tag) simply
+    # has no entry here, and its pair is omitted downstream — never fabricated.
+    catalog_tag_by_name: dict[str, str] = {r["catalog"]: r["tag"] for r in payload["catalog"] if r.get("tag")}
+
     # 2. Schemas — one call per schema, grounded in its own entity names.
     fail_schemas = [r for r in detail.get("schemas", []) if r.get("status") == "FAIL"][:_CAP["schemas"]]
     entities_by_schema: dict[tuple, list] = {}
@@ -399,7 +530,8 @@ async def _generate(detail: dict, s: dict, model: str, emit):
     await emit("schemas", 0, len(fail_schemas))
     if fail_schemas:
         stasks = [_gen_schema_item(model, sem, r["catalog"], r["schema"], r.get("pillar", ""),
-                                   entities_by_schema.get((r["catalog"], r["schema"]), [])) for r in fail_schemas]
+                                   entities_by_schema.get((r["catalog"], r["schema"]), []),
+                                   catalog_tag_by_name.get(r["catalog"], "")) for r in fail_schemas]
         done = 0
         for coro in asyncio.as_completed(stasks):
             payload["schema"].append(await coro)
@@ -408,10 +540,18 @@ async def _generate(detail: dict, s: dict, model: str, emit):
                 await emit("schemas", done, len(stasks))
     await emit("schemas", len(fail_schemas), len(fail_schemas))
 
+    # Schema Sheet's OWN generated tag, by (catalog, schema) — same omit-if-absent
+    # rule as above.
+    schema_tag_by_key: dict[tuple, str] = {(r["catalog"], r["schema"]): r["tag"] for r in payload["schema"] if r.get("tag")}
+
     # 3. Entities (per-entity LLM; needs column names). Each call returns an
     # entity-grain row plus its own column-grain rows — kept in separate payload
-    # lists so the workbook's Entity and Entity_Columns sheets stay at their own grain.
-    fail_entities = [r for r in detail.get("entities", []) if r.get("status") == "FAIL"][:_CAP["entities"]]
+    # lists so the workbook's Entity and Entity_Columns sheets stay at their own
+    # grain. __materialization* tables are Lakeflow/DLT-internal materialization
+    # aliases, not user-facing tables — never generated, never included in the
+    # workbook.
+    fail_entities = [r for r in detail.get("entities", []) if r.get("status") == "FAIL"
+                     and not r["entity"].lower().startswith("__materialization")][:_CAP["entities"]]
     ent_keys = {(r["catalog"], r["schema"], r["entity"]) for r in fail_entities}
     cols_map = await _entity_columns(s, ent_keys)
     # uncommented columns per entity → only comment those
@@ -423,7 +563,9 @@ async def _generate(detail: dict, s: dict, model: str, emit):
     for r in fail_entities:
         k = (r["catalog"], r["schema"], r["entity"])
         cols = failing_cols_by.get(k) or cols_map.get(k, [])
-        tasks.append(_gen_entity(model, sem, r["catalog"], r["schema"], r["entity"], r.get("pillar", ""), cols))
+        tasks.append(_gen_entity(model, sem, r["catalog"], r["schema"], r["entity"], r.get("pillar", ""), cols,
+                                 catalog_tag_by_name.get(r["catalog"], ""),
+                                 schema_tag_by_key.get((r["catalog"], r["schema"]), "")))
     done = 0
     for coro in asyncio.as_completed(tasks):
         entity_row, column_rows = await coro
@@ -480,15 +622,19 @@ def _blank(v) -> bool:
 def _compute_failures(payload: dict) -> dict:
     """Per-section count of rows whose LLM-drafted field(s) came back blank — the
     call ran (or was attempted) but produced no usable content; `_llm_json` already
-    logged why. Deterministic sections (relationship_pk/fk are derived from column
-    names, not the LLM) are never counted here. Surfaced in the SSE `complete`
-    event so a partial failure is visible in the UI, not just the app log."""
+    logged why. Deterministic sections (relationship_pk/fk derived from column
+    names; quality_tier, table_type's heuristic fallback, and pii's column-name
+    OR-signal) are never counted here — checking the rendered Tag_Generated cell
+    would under-count, since those deterministic pieces make it non-blank even
+    when the LLM portion (description/usecase) came back empty. Surfaced in the
+    SSE `complete` event so a partial failure is visible in the UI, not just the
+    app log."""
     def count(rows, *fields):
         return sum(1 for r in rows if all(_blank(r.get(f)) for f in fields))
     return {
         "catalog": count(payload.get("catalog", []), "description", "tag"),
-        "schema": count(payload.get("schema", []), "description", "tag"),
-        "entity": count(payload.get("entity", []), "entity_description", "entity_tag"),
+        "schema": count(payload.get("schema", []), "description", "usecase"),
+        "entity": count(payload.get("entity", []), "entity_description", "usecase"),
         "entity_columns": count(payload.get("entity_columns", []), "column_comment"),
         "genie_agent": count(payload.get("genie_agent", []), "instructions"),
         "metric_views": count(payload.get("metric_views", []), "text"),

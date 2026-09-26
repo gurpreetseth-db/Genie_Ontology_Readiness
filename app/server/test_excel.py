@@ -45,11 +45,16 @@ def test_assessment_workbook_has_all_sections():
 
 
 def test_generation_workbook_exact_spec():
+    # No "pillar" key anywhere below — Catalog/Schema/Entity dropped the Pillar
+    # column entirely from the generation workbook (assessment report still has
+    # it; that's a separate, unrelated sheet builder).
     payload = {
-        "catalog": [{"pillar": "sales", "catalog": "main", "description": "d", "tag": "t"}],
-        "schema": [{"pillar": "sales", "catalog": "main", "schema": "s1", "description": "d", "tag": "t"}],
-        "entity": [{"pillar": "sales", "catalog": "main", "schema": "s1", "entity": "orders",
-                    "entity_description": "d", "entity_tag": "t"}],
+        "catalog": [{"catalog": "main", "description": "d", "tag": "data_product = sales"}],
+        "schema": [{"catalog": "main", "schema": "s1", "description": "d",
+                   "tag": "data_product = sales, quality_tier = Gold, usecase = u"}],
+        "entity": [{"catalog": "main", "schema": "s1", "entity": "orders",
+                    "entity_description": "d",
+                    "entity_tag": "data_product = sales, table_type = fact, pii = false, usecase = u"}],
         "entity_columns": [{"catalog": "main", "schema": "s1", "entity": "orders",
                             "column": "amount", "column_comment": "c"}],
         "relationship_pk": [{"catalog": "main", "schema": "s1", "parent_entity": "orders",
@@ -65,10 +70,10 @@ def test_generation_workbook_exact_spec():
     for tab in ("Catalog", "Schema", "Entity", "Entity_Columns", "Relationship_PrimaryKey",
                 "Relationship_ForeignKey", "GenieAgent", "MetricViews"):
         assert tab in wb.sheetnames, f"missing tab {tab}"
-    assert _headers(wb, "Catalog") == ["Pillar", "Catalog", "Catalog_Description_Generated", "Catalog_Tag_Generated"]
-    assert _headers(wb, "Schema") == ["Pillar", "Catalog", "Schema", "Schema_Description_Generated", "Schema_Tag_Generated"]
-    # Entity is entity-grain only — no Column / Column_Comment_Generated here.
-    assert _headers(wb, "Entity") == ["Pillar", "Catalog", "Schema", "Entity",
+    assert _headers(wb, "Catalog") == ["Catalog", "Catalog_Description_Generated", "Catalog_Tag_Generated"]
+    assert _headers(wb, "Schema") == ["Catalog", "Schema", "Schema_Description_Generated", "Schema_Tag_Generated"]
+    # Entity is entity-grain only — no Column / Column_Comment_Generated / Pillar here.
+    assert _headers(wb, "Entity") == ["Catalog", "Schema", "Entity",
                                       "Entity_Description_Generated", "Entity_Tag_Generated"]
     assert _headers(wb, "Entity_Columns") == ["Catalog", "Schema", "Entity", "Column", "Column_Comments_Generated"]
     assert _headers(wb, "Relationship_PrimaryKey") == ["Catalog", "Schema", "Parent_Entity", "Column_Name",
@@ -81,10 +86,12 @@ def test_generation_workbook_exact_spec():
     # Constraint_Type constants are stamped by the builder, not the payload.
     assert wb["Relationship_PrimaryKey"]["E2"].value == "PrimaryKey"
     assert wb["Relationship_ForeignKey"]["H2"].value == "ForeignKey"
-    # The generated description/tag/comment actually landed (regression guard for
-    # the per-item generation fix — a batched, name-echo-matched call used to blank
-    # every row silently).
-    assert wb["Catalog"]["C2"].value == "d" and wb["Catalog"]["D2"].value == "t"
-    assert wb["Schema"]["D2"].value == "d" and wb["Schema"]["E2"].value == "t"
-    assert wb["Entity"]["E2"].value == "d" and wb["Entity"]["F2"].value == "t"
+    # The generated description/tag/comment actually landed, in the key=value
+    # tag format (regression guard for the per-item generation fix — a batched,
+    # name-echo-matched call used to blank every row silently).
+    assert wb["Catalog"]["B2"].value == "d" and wb["Catalog"]["C2"].value == "data_product = sales"
+    assert wb["Schema"]["C2"].value == "d"
+    assert wb["Schema"]["D2"].value == "data_product = sales, quality_tier = Gold, usecase = u"
+    assert wb["Entity"]["D2"].value == "d"
+    assert wb["Entity"]["E2"].value == "data_product = sales, table_type = fact, pii = false, usecase = u"
     assert wb["Entity_Columns"]["E2"].value == "c"
