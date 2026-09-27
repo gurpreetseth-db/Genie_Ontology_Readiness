@@ -159,7 +159,8 @@ class PerItemGenerationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["description"], "Sales schema.")
         self.assertEqual(row["usecase"], "order_analytics_for_the")  # normalized: first 4 words, lower_snake_case
         self.assertEqual(row["quality_tier"], "Gold")  # from the "gold_" schema name
-        self.assertEqual(row["tag"], "data_product = sales, quality_tier = Gold, usecase = order_analytics_for_the")
+        self.assertEqual(row["tag"],
+                         "data_product = sales, quality_tier = Gold, schema_usecase = order_analytics_for_the")
 
     async def test_schema_item_omits_catalog_pair_when_catalog_wasnt_generated(self):
         """If the parent catalog already had governance (so it never appears in
@@ -169,7 +170,7 @@ class PerItemGenerationTest(unittest.IsolatedAsyncioTestCase):
         execute = AsyncMock(return_value=[{"resp": json.dumps({"description": "d", "usecase": "u"})}])
         with patch.object(gen, "execute_sql", execute):
             row = await gen._gen_schema_item("model", sem, "main", "bronze_raw", "p", [], "")
-        self.assertEqual(row["tag"], "quality_tier = Bronze, usecase = u")
+        self.assertEqual(row["tag"], "quality_tier = Bronze, schema_usecase = u")
 
     async def test_entity_generation_rolls_up_named_components_without_duplicating_data_product(self):
         """Regression test for the reported duplication: the entity's tag must

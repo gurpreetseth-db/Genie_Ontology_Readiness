@@ -429,8 +429,13 @@ async def _gen_schema_item(model, sem, cat, sch, pillar, entity_names, catalog_t
     (`catalog_tag` — looked up by catalog name in the already-built Catalog sheet;
     omitted if that catalog wasn't itself generated, e.g. it already had a real
     description/tag) plus `quality_tier` (deterministic — Bronze/Silver/Gold from
-    medallion-style naming) and `usecase` — a SHORT category label (e.g.
-    `customer`, `region`), never a descriptive sentence."""
+    medallion-style naming) and `schema_usecase` — a SHORT category label (e.g.
+    `customer`, `region`), never a descriptive sentence. Rendered as
+    `schema_usecase` (not the bare `usecase`) so the label is unambiguous on its
+    own sheet and matches exactly what Entity_Tag_Generated already calls it when
+    it rolls this same value up — that downstream flow reads the ROW's internal
+    `usecase` key, not this rendered string, so relabeling the string here changes
+    nothing about it (see `_generate`'s `schema_row_by_key` lookup)."""
     async with sem:
         ctx = f" It contains tables: {json.dumps(entity_names[:60])}." if entity_names else ""
         usecase_ask = _USECASE_ASK.format(noun="this schema")
@@ -442,7 +447,7 @@ async def _gen_schema_item(model, sem, cat, sch, pillar, entity_names, catalog_t
         desc = _pick_str(data, "description")
         usecase = _normalize_tag_value(_pick_str(data, "usecase"))
         tier = _quality_tier(cat, sch)
-        tag = _compose_tag(catalog_tag, f"quality_tier = {tier}", f"usecase = {usecase}" if usecase else "")
+        tag = _compose_tag(catalog_tag, f"quality_tier = {tier}", f"schema_usecase = {usecase}" if usecase else "")
         return {"pillar": pillar, "catalog": cat, "schema": sch,
                 "description": desc, "usecase": usecase, "quality_tier": tier, "tag": tag}
 

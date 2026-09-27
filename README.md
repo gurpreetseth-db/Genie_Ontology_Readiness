@@ -62,13 +62,14 @@ The Generate tab is **export-only** — it never writes to Unity Catalog.
   it). `Catalog_Tag_Generated` is `data_product = <model-generated value>`. `Schema_Tag_Generated`
   rolls up the parent catalog's own generated tag (looked up by catalog name in the Catalog
   sheet — omitted if that catalog wasn't itself generated) plus `quality_tier` (deterministic
-  Bronze/Silver/Gold from medallion-style naming, so it's never blank) and `usecase` — a
+  Bronze/Silver/Gold from medallion-style naming, so it's never blank) and `schema_usecase` — a
   **short business-domain category label** (1-3 lower_snake_case words, e.g. `customer`,
   `region`, `date_dimension` — a classification, not a description; normalized defensively if
   a reply still comes back sentence-shaped). `Entity_Tag_Generated` rolls up NAMED
   COMPONENTS rather than gluing in whole ancestor tag strings — the catalog's `data_product`
-  pair (once, not duplicated), the schema's *raw* `quality_tier` and `usecase` (relabeled
-  `schema_usecase` here, so it's never confused with the entity's own), plus this entity's own
+  pair (once, not duplicated), the schema's own `quality_tier` and `schema_usecase` (the exact
+  same labels the Schema sheet itself uses — read from the schema's row, not re-parsed from its
+  rendered string), plus this entity's own
   `table_type` (dimension/fact/metric — the model's read, backstopped by a naming/column-shape
   heuristic), `pii` (true if *either* the model or a column-name heuristic flags it), and its
   own `entity_usecase` category label. Tables named `__materialization*` (Lakeflow/DLT-internal

@@ -51,7 +51,7 @@ def test_generation_workbook_exact_spec():
     payload = {
         "catalog": [{"catalog": "main", "description": "d", "tag": "data_product = sales"}],
         "schema": [{"catalog": "main", "schema": "s1", "description": "d",
-                   "tag": "data_product = sales, quality_tier = Gold, usecase = u"}],
+                   "tag": "data_product = sales, quality_tier = Gold, schema_usecase = u"}],
         "entity": [{"catalog": "main", "schema": "s1", "entity": "orders",
                     "entity_description": "d",
                     "entity_tag": "data_product = sales, quality_tier = Gold, schema_usecase = u, "
@@ -92,7 +92,7 @@ def test_generation_workbook_exact_spec():
     # name-echo-matched call used to blank every row silently).
     assert wb["Catalog"]["B2"].value == "d" and wb["Catalog"]["C2"].value == "data_product = sales"
     assert wb["Schema"]["C2"].value == "d"
-    assert wb["Schema"]["D2"].value == "data_product = sales, quality_tier = Gold, usecase = u"
+    assert wb["Schema"]["D2"].value == "data_product = sales, quality_tier = Gold, schema_usecase = u"
     assert wb["Entity"]["D2"].value == "d"
     assert wb["Entity"]["E2"].value == ("data_product = sales, quality_tier = Gold, schema_usecase = u, "
                                         "table_type = fact, pii = false, entity_usecase = u2")
