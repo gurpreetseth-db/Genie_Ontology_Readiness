@@ -144,14 +144,25 @@ def _generate_system(sc: Optional[dict]) -> str:
 THIS WORKSPACE'S ASSESSMENT (this is your source of truth — reference the actual numbers, levels, and gaps):
 {_scorecard_digest(sc)}
 
-PUBLIC DATABRICKS ACCELERATORS you may recommend (only these; each is a real, Databricks-built, publicly available asset). When an accelerator maps to a weak pillar, name it and include its link so the customer can act:
+THIS APP'S OWN GENERATE TAB (always available, no external setup — recommend this FIRST for these
+gaps, ahead of or alongside any external accelerator below): the same app has a "Generate" tab that
+reads this exact assessment and uses AI to draft, for review — never applied automatically:
+- Catalog/Schema/Entity descriptions and governed tags (closes Metadata Richness gaps)
+- Primary/foreign-key ALTER TABLE statements (closes Relationships & Modeling gaps)
+- A candidate metric view per schema (closes Metrics gaps)
+- Missing instructions for existing Genie Agents (closes part of the Genie Agents gap)
+The customer reviews the generated Excel and applies what they approve. It does NOT create new
+Genie Agents, draft example SQL/benchmark questions, or assign stewardship/certification tags —
+for those, use the external accelerators below.
+
+PUBLIC DATABRICKS ACCELERATORS you may ALSO recommend (only these; each is a real, Databricks-built, publicly available asset, distinct from this app's own Generate tab above). When one maps to a weak pillar — especially one Generate doesn't cover — name it and include its link:
 {_accelerator_catalog()}
 
 {methodology_prompt()}
 
 Keep it tight and scannable — no filler, no generic multi-phase project plan. The document already opens with a deterministic score summary, so do NOT restate the score table; start directly at "Where you are". Produce exactly these sections:
 1. **Where you are** — 2-3 sentences on their readiness, tied to their overall score/stage and their biggest levers (the lowest-scoring, highest-weight pillars).
-2. **Top recommendations** — the 4-6 highest-impact actions, prioritized worst-gap first. Each bullet must: (a) name the specific pillar/gap it closes, (b) give the concrete technical step AND the business/ownership step, and (c) where one applies, name the relevant accelerator above with its link.
+2. **Top recommendations** — the 4-6 highest-impact actions, prioritized worst-gap first. Each bullet must: (a) name the specific pillar/gap it closes, (b) give the concrete technical step AND the business/ownership step, and (c) where one applies, name this app's Generate tab and/or the relevant external accelerator above with its link — prefer Generate when it covers the gap.
 3. **Suggested sequence** — a NUMBERED list of clear, tactical steps the customer can follow in order (what to do first → next). Each step is a concrete action (e.g. "Declare PK/FK constraints on your 8 gold fact tables"), not a theme. Where the work involves building metric views, Genie Agents, or domain tags, follow the BUILD METHODOLOGY above — reflect its phases and non-negotiable techniques (one source per metric view, validate one measure at a time, base views for multi-fact KPIs, one focused Genie Agent per domain, benchmark + regression-test). Make these specific enough to hand to a data team.
 
 Do not invent scores or accelerators that are not listed above. Be specific to the assessment numbers."""

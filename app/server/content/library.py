@@ -113,6 +113,9 @@ CAPABILITIES: dict[str, dict] = {
         "technical_value": "Higher first-attempt accuracy; less manual instruction-writing in each Genie Agent.",
         "business_value": "Faster, more trustworthy self-serve answers and better discovery in Catalog Explorer.",
         "technical_enablement": [
+            "Fastest first pass: use this app's own Generate tab — it reads your assessment's failing "
+            "catalogs/schemas/tables/columns and drafts descriptions and governed tags via AI, into an "
+            "Excel for review before you apply anything.",
             "Add COMMENT to every gold-layer table and column.",
             "Use AI-generated comments as a first draft, then have stewards refine them.",
             "Apply governed tags/classifications (PII, domain, certified).",
@@ -139,6 +142,9 @@ CAPABILITIES: dict[str, dict] = {
         "technical_value": "Reliable join inference; fewer wrong-cardinality answers.",
         "business_value": "Analytics-ready data, so business questions resolve without data-engineering tickets.",
         "technical_enablement": [
+            "Fastest first pass: use this app's own Generate tab — it drafts ready-to-run "
+            "`ALTER TABLE ... ADD CONSTRAINT` PRIMARY KEY / FOREIGN KEY statements (heuristic, from "
+            "column-name conventions) for review. It does not build the gold layer itself.",
             "Declare PRIMARY KEY / FOREIGN KEY constraints on gold fact and dimension tables.",
             "Build a curated gold layer (star/snowflake) for analytics consumption.",
             "Document common join paths.",
@@ -162,6 +168,9 @@ CAPABILITIES: dict[str, dict] = {
         "technical_value": "One definition of each KPI consumed everywhere; no metric drift between BI and Genie.",
         "business_value": "Everyone — and every AI agent — computes revenue, churn, and margin the same certified way.",
         "technical_enablement": [
+            "Fastest first pass: use this app's own Generate tab — it proposes one candidate metric "
+            "view per schema (measures, dimensions, from your actual tables) as a starting draft for "
+            "a data engineer to validate and refine, not a finished definition.",
             "Define metric views in YAML for your top KPIs (measures, dimensions, joins).",
             "Add synonyms, display names, and formatting for agent-friendliness.",
             "Use the same metric views in dashboards and Genie Agents.",
@@ -189,6 +198,9 @@ CAPABILITIES: dict[str, dict] = {
         "business_value": "Self-serve answers for business users without writing SQL; faster decisions.",
         "technical_enablement": [
             "Create a Genie Agent scoped to a domain's gold tables and metric views.",
+            "Partial first pass: this app's own Generate tab drafts instructions for EXISTING agents "
+            "that are missing them — for review before you paste them in. It does not create new "
+            "agents or draft example SQL / benchmark questions; write those yourself.",
             "Add instructions, example/verified SQL, and benchmark questions.",
             "Test answer quality and iterate on the instructions.",
         ],
@@ -215,6 +227,9 @@ CAPABILITIES: dict[str, dict] = {
         "business_value": "Clear ownership and trust, and an internal marketplace where teams find certified, governed assets.",
         "technical_enablement": [
             "Define domains around business capabilities (e.g. Sales, Risk, Supply Chain).",
+            "Partial first pass: this app's own Generate tab drafts a `data_product` governed tag per "
+            "catalog/schema/table (a recognized domain-tag key) — but it does not assign stewards/"
+            "owners or suggest certification; do those manually, prioritizing your most-accessed assets.",
             "Assign assets (catalogs/schemas/tables/metric views) to domains.",
             "Mark certified assets so authority is signaled to agents.",
         ],
