@@ -17,3 +17,8 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(deps)"
+    ignore:
+      # Tailwind v4 drops the PostCSS plugin and changes defaults; migrating
+      # postcss.config.js / tailwind.config.js / index.css is a deliberate job.
+      - dependency-name: tailwindcss
+        update-types: ["version-update:semver-major"]
