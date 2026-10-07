@@ -11,7 +11,6 @@ const STAGES: { key: string; label: string }[] = [
   { key: 'entities', label: 'Entity descriptions, tags & column comments' },
   { key: 'relationships', label: 'Primary / foreign key statements' },
   { key: 'genie_agents', label: 'Genie Agent instructions' },
-  { key: 'metric_views', label: 'Metric view definitions' },
 ];
 
 type GenEvent =
@@ -26,7 +25,6 @@ const FAILURE_LABELS: Record<string, string> = {
   entity: 'entity',
   entity_columns: 'column',
   genie_agent: 'agent',
-  metric_views: 'metric view',
 };
 
 type Progress = { done: number; total: number };
@@ -120,7 +118,7 @@ export default function GenerateWizard({
           <h2 className="text-xl font-bold text-ink-900">Generate the missing metadata</h2>
           <p className="text-sm text-ink-600 mt-2 leading-relaxed">
             Uses your workspace's own Foundation Model API (model: <span className="font-medium">{model}</span>) to draft
-            the descriptions, tags, column comments, Genie-agent instructions and metric-view definitions your estate is
+            the descriptions, tags, column comments and Genie-agent instructions your estate is
             missing — plus ready-to-run primary/foreign-key statements. Everything downloads as an Excel workbook for
             review. <span className="font-medium">Nothing is applied to Unity Catalog.</span>
           </p>
@@ -132,8 +130,9 @@ export default function GenerateWizard({
           </h3>
           <p className="text-sm text-ink-700 leading-relaxed">
             One workbook with a tab per artifact — <span className="font-medium">Catalog, Schema, Entity,
-            Entity_Columns, Relationship_PrimaryKey, Relationship_ForeignKey, GenieAgent, MetricViews</span> — each row
-            a suggested fix you can review and apply. Every description/tag/comment is drafted by the selected model
+            Entity_Columns, Relationship_PrimaryKey, Relationship_ForeignKey, GenieAgent</span> — each row
+            a suggested fix you can review and apply, with a ready-to-run COMMENT / SET TAGS command beside every
+            generated description, tag and column comment. Every description/tag/comment is drafted by the selected model
             after reviewing the real catalog, schema, table and column names — not a template. PK/FK relationships
             are proposed heuristically; review before applying.
           </p>
@@ -197,7 +196,6 @@ export default function GenerateWizard({
                   (counts.relationship_pk || counts.relationship_fk) &&
                     `${(counts.relationship_pk || 0) + (counts.relationship_fk || 0)} relationship`,
                   counts.genie_agent && `${counts.genie_agent} agent`,
-                  counts.metric_views && `${counts.metric_views} metric-view`,
                 ]
                   .filter(Boolean)
                   .join(', ') || 'no'}{' '}

@@ -2,8 +2,8 @@
 
 `POST /generate/stream` runs the entity-level detail (scoped), then uses the
 workspace's own Foundation Model API to DRAFT the missing metadata —
-catalog/schema/entity descriptions + tags, column comments, Genie-agent
-instructions, and metric-view definitions — and derives PK/FK DDL
+catalog/schema/entity descriptions + tags, column comments and Genie-agent
+instructions — and derives PK/FK DDL
 deterministically. It streams progress (SSE) and ends with a `download_token`;
 `GET /generate/excel/{token}` returns the assembled workbook.
 
@@ -56,7 +56,7 @@ _XLSX_MEDIA = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
 
 # Bounds so a wide scope can't fan out an unbounded number of LLM calls / blow the
 # gateway timeout. Generation is best run scoped to a catalog/schema.
-_CAP = {"catalogs": 40, "schemas": 60, "entities": 80, "agents": 15, "mv_schemas": 20}
+_CAP = {"catalogs": 40, "schemas": 60, "entities": 80, "agents": 15}
 _CONCURRENCY = 4
 
 # token -> (created_ts, filename, bytes). Small in-process store so the long LLM run
@@ -528,16 +528,6 @@ async def _gen_agent(model, sem, name, sid):
         return {"name": name, "space_id": sid, "instructions": _pick_str(data, "instructions")}
 
 
-async def _gen_metric_view(model, sem, cat, sch, entities_summary):
-    async with sem:
-        user = (f"Propose ONE Unity Catalog metric view for schema `{cat}.{sch}` based on these "
-                f"tables/columns: {json.dumps(entities_summary)[:4000]}. Return STRICT JSON "
-                '{"text": "<CREATE VIEW ... WITH METRICS LANGUAGE YAML ... $$ ... $$>"} with '
-                "sensible measures and dimensions. Use fully-qualified names.")
-        data = await _llm_json(model, _SYS_META, user, _what=f"metric view {cat}.{sch}") or {}
-        return {"catalog": cat, "schema": sch, "text": _pick_str(data, "text", "sql", "ddl")}
-
-
 async def _generate(detail: dict, s: dict, model: str, emit):
     """Build the generation payload from the failing items in `detail`. Every
     catalog/schema/entity is a SEPARATE, grounded LLM call (never a batch the model
@@ -546,7 +536,7 @@ async def _generate(detail: dict, s: dict, model: str, emit):
     sem = asyncio.Semaphore(_CONCURRENCY)
     payload: dict = {"catalog": [], "schema": [], "entity": [], "entity_columns": [],
                      "relationship_pk": [], "relationship_fk": [],
-                     "genie_agent": [], "metric_views": []}
+                     "genie_agent": []}
 
     # 1. Catalogs — one call per catalog, grounded in its own schema names.
     fail_cats = [r for r in detail.get("catalogs", []) if r.get("status") == "FAIL"][:_CAP["catalogs"]]
@@ -653,18 +643,6 @@ async def _generate(detail: dict, s: dict, model: str, emit):
         payload["genie_agent"] = await asyncio.gather(*atasks)
     await emit("genie_agents", len(agents), len(agents))
 
-    # 6. Metric views — one proposed per schema that has entities (cap)
-    ent_by_schema: dict[tuple, list] = {}
-    for r in detail.get("entities", []):
-        ent_by_schema.setdefault((r["catalog"], r["schema"]), []).append(
-            {"entity": r["entity"], "columns": r.get("columns")})
-    mv_schemas = list(ent_by_schema.items())[:_CAP["mv_schemas"]]
-    await emit("metric_views", 0, len(mv_schemas))
-    if mv_schemas:
-        mtasks = [_gen_metric_view(model, sem, cat, sch, ents) for (cat, sch), ents in mv_schemas]
-        payload["metric_views"] = await asyncio.gather(*mtasks)
-    await emit("metric_views", len(mv_schemas), len(mv_schemas))
-
     return payload
 
 
@@ -690,7 +668,6 @@ def _compute_failures(payload: dict) -> dict:
         "entity": count(payload.get("entity", []), "entity_description", "entity_usecase"),
         "entity_columns": count(payload.get("entity_columns", []), "column_comment"),
         "genie_agent": count(payload.get("genie_agent", []), "instructions"),
-        "metric_views": count(payload.get("metric_views", []), "text"),
     }
 
 
