@@ -6,8 +6,9 @@ Two public builders:
     catalogs / schemas / entities / columns / relationships / metric views / Genie
     Agents / non-certified assets are failing the readiness checks.
   * ``build_generation_workbook(payload)`` — the LLM-drafted fixes, laid out in the
-    exact tabs/columns the spec defines (Catalog, Schema, Entity, two Relationship
-    sheets, GenieAgent, MetricViews).
+    exact tabs/columns the spec defines (Catalog, Schema, Entity, Entity_Columns,
+    two Relationship sheets, GenieAgent), with ready-to-run *_Command SQL beside
+    each generated description/tag/comment.
 
 Both return a ``BytesIO`` positioned at 0, ready to stream. openpyxl only; no
 template files.
@@ -15,6 +16,7 @@ template files.
 
 import io
 import logging
+import re
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -70,6 +72,68 @@ def _sheet(wb: Workbook, title: str, headers: list[str], rows: list[list],
 
 def _yn(v) -> str:
     return "Yes" if v else "No"
+
+
+# ---------------------------------------------------------------------------
+# Ready-to-run SQL for the generation workbook's *_Command columns
+# ---------------------------------------------------------------------------
+_PLAIN_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _quoted(name) -> str:
+    return "`" + str(name).replace("`", "``") + "`"
+
+
+def _ident(name) -> str:
+    """Identifier as written, backtick-quoted only when it needs it (hyphens,
+    spaces, a leading digit...)."""
+    name = str(name or "")
+    return name if _PLAIN_IDENT.match(name) else _quoted(name)
+
+
+def _fqn(*parts) -> str:
+    return ".".join(_ident(p) for p in parts)
+
+
+def _lit(text) -> str:
+    """Single-quoted SQL string literal. Spark SQL escapes with a backslash — a
+    doubled '' is two adjacent literals, not an escaped quote."""
+    return "'" + str(text).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _tag_pairs(tag) -> list[tuple[str, str]]:
+    """Parse a *_Tag_Generated cell ("k1 = v1, k2 = v2") into (key, value) pairs:
+    left of the first '=' is the key, right of it (up to the comma) the value."""
+    pairs = []
+    for chunk in str(tag or "").split(","):
+        key, sep, value = chunk.partition("=")
+        if sep and key.strip():
+            pairs.append((key.strip(), value.strip()))
+    return pairs
+
+
+def _comment_cmd(kind: str, fqn: str, text) -> str:
+    return f"COMMENT ON {kind} {fqn} IS {_lit(text)}" if str(text or "").strip() else ""
+
+
+def _catalog_tag_cmd(catalog, tag) -> str:
+    # SET TAG takes key/value as identifiers (backticks, not quotes) and one pair
+    # per statement, so a multi-pair cell becomes ';'-separated statements.
+    return "; ".join(f"SET TAG ON CATALOG {_ident(catalog)} {_quoted(k)} = {_quoted(v)}"
+                     for k, v in _tag_pairs(tag))
+
+
+def _set_tags_cmd(kind: str, fqn: str, tag) -> str:
+    pairs = _tag_pairs(tag)
+    if not pairs:
+        return ""
+    return f"ALTER {kind} {fqn} SET TAGS ({', '.join(f'{_lit(k)} = {_lit(v)}' for k, v in pairs)})"
+
+
+def _column_comment_cmd(cat, sch, ent, col, text) -> str:
+    if not str(text or "").strip():
+        return ""
+    return f"ALTER TABLE {_fqn(cat, sch, ent)} ALTER COLUMN {_ident(col)} COMMENT {_lit(text)}"
 
 
 def _finalize(wb: Workbook) -> io.BytesIO:
@@ -180,30 +244,43 @@ def build_generation_workbook(payload: dict) -> io.BytesIO:
     p = payload or {}
 
     _sheet(wb, "Catalog",
-           ["Catalog", "Catalog_Description_Generated", "Catalog_Tag_Generated"],
-           [[r.get("catalog"), r.get("description"), r.get("tag")]
+           ["Catalog", "Catalog_Description_Generated", "Catalog_Tag_Generated",
+            "Catalog_Description_Command", "Catalog_Tag_Command"],
+           [[r.get("catalog"), r.get("description"), r.get("tag"),
+             _comment_cmd("CATALOG", _fqn(r.get("catalog")), r.get("description")),
+             _catalog_tag_cmd(r.get("catalog"), r.get("tag"))]
             for r in p.get("catalog", [])],
-           widths=[28, 60, 40], wrap_last=True)
+           widths=[28, 60, 40, 70, 60], wrap_last=True)
 
     _sheet(wb, "Schema",
-           ["Catalog", "Schema", "Schema_Description_Generated", "Schema_Tag_Generated"],
-           [[r.get("catalog"), r.get("schema"), r.get("description"), r.get("tag")]
+           ["Catalog", "Schema", "Schema_Description_Generated", "Schema_Tag_Generated",
+            "Schema_Description_Command", "Schema_Tag_Command"],
+           [[r.get("catalog"), r.get("schema"), r.get("description"), r.get("tag"),
+             _comment_cmd("SCHEMA", _fqn(r.get("catalog"), r.get("schema")), r.get("description")),
+             _set_tags_cmd("SCHEMA", _fqn(r.get("catalog"), r.get("schema")), r.get("tag"))]
             for r in p.get("schema", [])],
-           widths=[24, 24, 60, 55], wrap_last=True)
+           widths=[24, 24, 60, 55, 70, 80], wrap_last=True)
 
     _sheet(wb, "Entity",
            ["Catalog", "Schema", "Entity",
-            "Entity_Description_Generated", "Entity_Tag_Generated"],
+            "Entity_Description_Generated", "Entity_Tag_Generated",
+            "Entity_Description_Command", "Entity_Tag_Command"],
            [[r.get("catalog"), r.get("schema"), r.get("entity"),
-             r.get("entity_description"), r.get("entity_tag")]
+             r.get("entity_description"), r.get("entity_tag"),
+             _comment_cmd("TABLE", _fqn(r.get("catalog"), r.get("schema"), r.get("entity")),
+                          r.get("entity_description")),
+             _set_tags_cmd("TABLE", _fqn(r.get("catalog"), r.get("schema"), r.get("entity")),
+                           r.get("entity_tag"))]
             for r in p.get("entity", [])],
-           widths=[20, 20, 24, 60, 65], wrap_last=True)
+           widths=[20, 20, 24, 60, 65, 70, 90], wrap_last=True)
 
     _sheet(wb, "Entity_Columns",
-           ["Catalog", "Schema", "Entity", "Column", "Column_Comments_Generated"],
-           [[r.get("catalog"), r.get("schema"), r.get("entity"), r.get("column"), r.get("column_comment")]
+           ["Catalog", "Schema", "Entity", "Column", "Column_Comments_Generated", "Column_Comment_Command"],
+           [[r.get("catalog"), r.get("schema"), r.get("entity"), r.get("column"), r.get("column_comment"),
+             _column_comment_cmd(r.get("catalog"), r.get("schema"), r.get("entity"),
+                                 r.get("column"), r.get("column_comment"))]
             for r in p.get("entity_columns", [])],
-           widths=[20, 20, 24, 22, 60], wrap_last=True)
+           widths=[20, 20, 24, 22, 60, 80], wrap_last=True)
 
     _sheet(wb, "Relationship_PrimaryKey",
            ["Catalog", "Schema", "Parent_Entity", "Column_Name", "Constraint_Type", "Statement"],
@@ -224,10 +301,5 @@ def build_generation_workbook(payload: dict) -> io.BytesIO:
            [[r.get("name"), r.get("space_id"), r.get("instructions")]
             for r in p.get("genie_agent", [])],
            widths=[30, 24, 90], wrap_last=True)
-
-    _sheet(wb, "MetricViews",
-           ["Catalog", "Schema", "Text"],
-           [[r.get("catalog"), r.get("schema"), r.get("text")] for r in p.get("metric_views", [])],
-           widths=[24, 24, 100], wrap_last=True)
 
     return _finalize(wb)

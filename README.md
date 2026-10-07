@@ -18,8 +18,8 @@ Deploy it into a workspace and it will:
   accurate GA / preview status.
 - **Recommend** best practices for both technical enablement and business adoption.
 - **Generate** (1) a tailored, sequenced enablement + adoption plan, and (2) the **missing
-  metadata itself** — descriptions, tags, column comments, PK/FK statements, Genie-agent
-  instructions and metric-view definitions, drafted by the customer's **own Foundation
+  metadata itself** — descriptions, tags, column comments, PK/FK statements and Genie-agent
+  instructions, drafted by the customer's **own Foundation
   Model API** and downloaded as an Excel workbook for review.
 
 The assessment is **read-only** and degrades gracefully when a signal isn't available.
@@ -37,7 +37,12 @@ The Generate tab is **export-only** — it never writes to Unity Catalog.
 - **Generate tab** (`GenerateWizard.tsx`, `POST /api/generate/stream` →
   `GET /api/generate/excel/{token}`) — drafts the missing metadata via the workspace model
   picker and downloads a workbook with `Catalog`, `Schema`, `Entity`, `Entity_Columns`,
-  `Relationship_PrimaryKey`, `Relationship_ForeignKey`, `GenieAgent` and `MetricViews` tabs.
+  `Relationship_PrimaryKey`, `Relationship_ForeignKey` and `GenieAgent` tabs.
+  Catalog / Schema / Entity / Entity_Columns rows also carry ready-to-run SQL beside each
+  generated value — `*_Description_Command` (`COMMENT ON …`), `*_Tag_Command`
+  (`SET TAG ON CATALOG` for catalogs, `ALTER SCHEMA|TABLE … SET TAGS (…)` otherwise, one
+  pair per `key = value` in the tag cell) and `Column_Comment_Command`
+  (`ALTER TABLE … ALTER COLUMN … COMMENT`). Blank generated values leave the command blank.
   Every catalog, schema, entity and column is a **separate, grounded LLM call** (never a
   batch the model has to echo names back from), so one item's failure or rewording can
   never blank another item's fields. PK/FK suggestions are heuristic — review before applying.

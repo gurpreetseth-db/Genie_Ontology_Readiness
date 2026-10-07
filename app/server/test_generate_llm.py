@@ -335,7 +335,6 @@ class ComputeFailuresTest(unittest.TestCase):
             "entity_columns": [{"column": "amount", "column_comment": ""},
                                {"column": "id", "column_comment": "The primary key."}],
             "genie_agent": [{"name": "Sales", "instructions": ""}],
-            "metric_views": [],
         }
         failures = gen._compute_failures(payload)
         self.assertEqual(failures["catalog"], 1)
@@ -343,12 +342,11 @@ class ComputeFailuresTest(unittest.TestCase):
         self.assertEqual(failures["entity"], 0)
         self.assertEqual(failures["entity_columns"], 1)
         self.assertEqual(failures["genie_agent"], 1)
-        self.assertEqual(failures["metric_views"], 0)
 
     def test_missing_sections_count_as_zero_not_error(self):
         self.assertEqual(gen._compute_failures({}), {
             "catalog": 0, "schema": 0, "entity": 0,
-            "entity_columns": 0, "genie_agent": 0, "metric_views": 0,
+            "entity_columns": 0, "genie_agent": 0,
         })
 
 
