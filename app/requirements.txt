@@ -21,7 +21,7 @@ databricks-sdk~=0.143.0
 pydantic~=2.13
 asyncpg~=0.31.0
 markdown>=3.10.3
-xhtml2pdf>=0.2.21
+xhtml2pdf>=0.2.23
 
 # Multi-tab .xlsx export (entity-level assessment report + LLM-generation workbook).
 openpyxl~=3.1.5
